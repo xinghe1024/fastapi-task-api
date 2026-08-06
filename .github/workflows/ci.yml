@@ -1,0 +1,53 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  JWT_SECRET_KEY: "ci-only-secret-key-at-least-32-characters"
+  DATABASE_URL: "sqlite:///./ci.db"
+
+jobs:
+  quality:
+    name: Test migrations and image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.9"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run --frozen python -m pytest -q
+
+      - name: Apply migrations
+        run: uv run --frozen alembic upgrade head
+
+      - name: Check migration drift
+        run: uv run --frozen alembic check
+
+      - name: Build Docker image
+        run: docker build --tag fastapi-task-api:ci .
