@@ -1,0 +1,14 @@
+services:
+  api:
+    image: "${API_IMAGE:?必须提供 API_IMAGE}"
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.production
+    volumes:
+      - fastapi-task-data:/data
+    restart: unless-stopped
+
+volumes:
+  fastapi-task-data:
+    external: true
