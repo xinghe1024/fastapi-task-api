@@ -1,14 +1,39 @@
 services:
   api:
     image: "${API_IMAGE:?必须提供 API_IMAGE}"
-    ports:
-      - "8000:8000"
+    command:
+      - uvicorn
+      - main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+    expose:
+      - "8000"
     env_file:
       - .env.production
     volumes:
       - fastapi-task-data:/data
     restart: unless-stopped
 
+  proxy:
+    image: caddy:2.11.4-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   fastapi-task-data:
     external: true
+  caddy-data:
+  caddy-config:

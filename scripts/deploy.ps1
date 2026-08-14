@@ -32,7 +32,7 @@ function Wait-ApiReady {
     for ($attemptNumber = 1; $attemptNumber -le $MaximumAttempts; $attemptNumber++) {
         try {
             $null = Invoke-RestMethod `
-                -Uri "http://127.0.0.1:8000/health/ready" `
+                -Uri "http://127.0.0.1:8080/health/ready" `
                 -TimeoutSec 5
 
             return $true

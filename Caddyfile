@@ -1,0 +1,21 @@
+{
+    auto_https disable_redirects
+}
+
+(api_backend) {
+    log {
+        output stdout
+        format json
+    }
+
+    reverse_proxy api:8000
+}
+
+http://localhost {
+    import api_backend
+}
+
+https://localhost {
+    tls internal
+    import api_backend
+}

@@ -202,3 +202,35 @@ def test_tasks_require_authentication(
     assert response.json() == {
         "detail": "Not authenticated",
     }
+
+def test_login_rate_limit_rejects_sixth_attempt(
+    client: TestClient,
+) -> None:
+    login_payload = {
+        "username": "unknown-user",
+        "password": "wrong-password",
+    }
+
+    for _ in range(5):
+        response = client.post(
+            "/auth/token",
+            data=login_payload,
+        )
+
+        assert response.status_code == 401
+
+    limited_response = client.post(
+        "/auth/token",
+        data=login_payload,
+    )
+
+    assert limited_response.status_code == 429
+    assert limited_response.json() == {
+        "detail": "Too many login attempts",
+    }
+
+    retry_after_seconds = int(
+        limited_response.headers["retry-after"]
+    )
+
+    assert 1 <= retry_after_seconds <= 60

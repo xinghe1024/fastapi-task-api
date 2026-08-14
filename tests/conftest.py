@@ -19,6 +19,11 @@ from database import (
     Base,
     enable_sqlite_foreign_keys,
 )
+from rate_limit_dependencies import (
+    get_login_rate_limiter,
+)
+from rate_limiting import FixedWindowRateLimiter
+
 
 @pytest.fixture
 def client() -> Generator[TestClient, None, None]:
@@ -42,6 +47,15 @@ def client() -> Generator[TestClient, None, None]:
     Base.metadata.create_all(
         bind=test_engine,
     )
+
+    test_login_rate_limiter = FixedWindowRateLimiter(
+        request_limit=5,
+        window_seconds=60,
+    )
+
+    def override_get_login_rate_limiter(
+    ) -> FixedWindowRateLimiter:
+        return test_login_rate_limiter
 
     def override_get_session() -> Generator[
         Session,
@@ -88,6 +102,10 @@ def client() -> Generator[TestClient, None, None]:
     test_app.dependency_overrides[
         get_settings
     ] = override_get_settings
+
+    test_app.dependency_overrides[
+        get_login_rate_limiter
+    ] = override_get_login_rate_limiter
 
     try:
         with TestClient(test_app) as client:

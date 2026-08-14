@@ -18,6 +18,10 @@ from user_models import (
     UserResponse,
 )
 
+from rate_limit_dependencies import (
+    enforce_login_rate_limit,
+)
+
 from authentication import (
     authenticate_user,
     get_current_user,
@@ -99,7 +103,10 @@ def register_user(
     )
 
 @router.post(
-    '/token'
+    "/token",
+    dependencies=[
+        Depends(enforce_login_rate_limit),
+    ],
 )
 def login_for_access_token(
         form_data: Annotated[
