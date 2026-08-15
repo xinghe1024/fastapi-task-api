@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    external_service_url: str = "https://example.com"
     database_url: str = "sqlite:///./test.db"
     jwt_secret_key: SecretStr
     jwt_algorithm: str = "HS256"

@@ -1,3 +1,4 @@
+import httpx
 from fastapi import FastAPI
 from routers.tasks import router as task_router
 from routers.auth import router as auth_router
@@ -6,6 +7,7 @@ from routers.health import router as health_router
 from config import get_settings
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from routers.external import router as external_router
 
 from database import engine
 from middlewares import register_middlewares
@@ -16,10 +18,21 @@ from exception_handlers import (
 
 @asynccontextmanager
 async def lifespan(
-        _app: FastAPI,
+    app: FastAPI,
 ) -> AsyncGenerator[None]:
+    timeout = httpx.Timeout(
+        connect=3.0,
+        read=5.0,
+        write=5.0,
+        pool=2.0,
+    )
+
     try:
-        yield
+        async with httpx.AsyncClient(
+            timeout=timeout,
+        ) as http_client:
+            app.state.http_client = http_client
+            yield
     finally:
         engine.dispose()
 
@@ -34,3 +47,4 @@ register_middlewares(
 app.include_router(task_router)
 app.include_router(auth_router)
 app.include_router(health_router)
+app.include_router(external_router)

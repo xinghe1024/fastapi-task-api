@@ -23,7 +23,7 @@ from rate_limit_dependencies import (
     get_login_rate_limiter,
 )
 from rate_limiting import FixedWindowRateLimiter
-
+from routers.external import router as external_router
 
 @pytest.fixture
 def client() -> Generator[TestClient, None, None]:
@@ -73,6 +73,9 @@ def client() -> Generator[TestClient, None, None]:
             session.close()
 
     test_settings = Settings(
+        external_service_url=(
+            "https://upstream.test/health"
+        ),
         jwt_secret_key=(
             "test-secret-key-that-is-at-least-32-bytes"
         ),
@@ -91,6 +94,7 @@ def client() -> Generator[TestClient, None, None]:
     test_app.include_router(task_router)
     test_app.include_router(auth_router)
     test_app.include_router(health_router)
+    test_app.include_router(external_router)
 
     def override_get_settings() -> Settings:
         return test_settings
