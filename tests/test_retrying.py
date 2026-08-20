@@ -257,3 +257,50 @@ def test_retry_http_operation_applies_jitter(
         0.25,
         0.5,
     ]
+
+def test_retry_http_operation_caps_delay(
+) -> None:
+    attempt_count = 0
+    recorded_delays: list[float] = []
+
+    async def operation() -> int:
+        nonlocal attempt_count
+        attempt_count += 1
+
+        request = httpx.Request(
+            "GET",
+            "https://upstream.test/health",
+        )
+
+        raise httpx.ReadTimeout(
+            "Upstream service timed out",
+            request=request,
+        )
+
+    async def fake_sleep(
+        delay: float,
+    ) -> None:
+        recorded_delays.append(delay)
+
+    with pytest.raises(
+        httpx.ReadTimeout,
+    ):
+        asyncio.run(
+            retry_http_operation(
+                operation=operation,
+                max_attempts=5,
+                base_delay=2.0,
+                max_delay=3.0,
+                jitter_function=disable_jitter,
+                sleep_function=fake_sleep,
+            )
+        )
+
+    assert attempt_count == 5
+
+    assert recorded_delays == [
+        2.0,
+        3.0,
+        3.0,
+        3.0,
+    ]

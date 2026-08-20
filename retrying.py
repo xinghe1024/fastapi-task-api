@@ -55,6 +55,7 @@ async def retry_http_operation(
     *,
     max_attempts: int = 3,
     base_delay: float = 0.5,
+    max_delay: float = 5.0,
     jitter_function: Callable[
         [float],
         float,
@@ -88,13 +89,23 @@ async def retry_http_operation(
             if is_last_attempt:
                 raise
 
+            if max_delay < 0:
+                raise ValueError(
+                    "max_delay cannot be negative",
+                )
+
             exponential_delay = (
                     base_delay
                     * 2 ** attempt_index
             )
 
-            delay = jitter_function(
+            capped_delay = min(
                 exponential_delay,
+                max_delay,
+            )
+
+            delay = jitter_function(
+                capped_delay,
             )
 
             await sleep_function(delay)
