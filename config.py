@@ -28,8 +28,16 @@ class Settings(BaseSettings):
             "http://localhost:5173",
         ],
     )
-
-
+    external_service_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+    )
+    external_service_base_delay: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=10.0,
+    )
 
 
 @lru_cache

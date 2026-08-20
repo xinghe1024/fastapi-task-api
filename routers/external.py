@@ -42,6 +42,12 @@ async def check_external_service(
         await fetch_external_status(
             http_client=http_client,
             url=settings.external_service_url,
+            max_attempts=(
+                settings.external_service_max_attempts
+            ),
+            base_delay=(
+                settings.external_service_base_delay
+            ),
         )
     except httpx.TimeoutException as external_error:
         raise HTTPException(

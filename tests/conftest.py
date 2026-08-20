@@ -84,6 +84,8 @@ def client() -> Generator[TestClient, None, None]:
         cors_allowed_origins=[
             "http://test-frontend",
         ],
+        external_service_max_attempts=1,
+        external_service_base_delay=0.0,
     )
 
     test_app = FastAPI()
