@@ -6,6 +6,11 @@ import httpx
 
 import random
 
+class RetryBudgetExceededError(
+    TimeoutError,
+):
+    pass
+
 ResultType = TypeVar("ResultType")
 
 RETRYABLE_STATUS_CODES = frozenset({
@@ -56,6 +61,7 @@ async def retry_http_operation(
     max_attempts: int = 3,
     base_delay: float = 0.5,
     max_delay: float = 5.0,
+    total_timeout: float | None = None,
     jitter_function: Callable[
         [float],
         float,
@@ -75,40 +81,67 @@ async def retry_http_operation(
             "base_delay cannot be negative",
         )
 
-    for attempt_index in range(max_attempts):
-        try:
-            return await operation()
-        except httpx.HTTPError as error:
-            if not _is_retryable_http_error(error):
-                raise
+    if max_delay < 0:
+        raise ValueError(
+            "max_delay cannot be negative",
+        )
 
-            is_last_attempt = (
-                    attempt_index == max_attempts - 1
-            )
+    if (
+            total_timeout is not None
+            and total_timeout <= 0
+    ):
+        raise ValueError(
+            "total_timeout must be greater than 0",
+        )
 
-            if is_last_attempt:
-                raise
+    timeout_context = asyncio.timeout(
+        total_timeout,
+    )
 
-            if max_delay < 0:
-                raise ValueError(
-                    "max_delay cannot be negative",
-                )
+    try:
+        async with timeout_context:
+            for attempt_index in range(
+                    max_attempts,
+            ):
+                try:
+                    return await operation()
+                except httpx.HTTPError as error:
+                    if not _is_retryable_http_error(
+                            error,
+                    ):
+                        raise
 
-            exponential_delay = (
-                    base_delay
-                    * 2 ** attempt_index
-            )
+                    is_last_attempt = (
+                            attempt_index
+                            == max_attempts - 1
+                    )
 
-            capped_delay = min(
-                exponential_delay,
-                max_delay,
-            )
+                    if is_last_attempt:
+                        raise
 
-            delay = jitter_function(
-                capped_delay,
-            )
+                    exponential_delay = (
+                            base_delay
+                            * 2 ** attempt_index
+                    )
 
-            await sleep_function(delay)
+                    capped_delay = min(
+                        exponential_delay,
+                        max_delay,
+                    )
+
+                    delay = jitter_function(
+                        capped_delay,
+                    )
+
+                    await sleep_function(delay)
+
+    except TimeoutError as error:
+        if timeout_context.expired():
+            raise RetryBudgetExceededError(
+                "Retry time budget exceeded",
+            ) from error
+
+        raise
 
     raise RuntimeError(
         "Retry loop ended unexpectedly",

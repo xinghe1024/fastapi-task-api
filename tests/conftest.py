@@ -10,6 +10,10 @@ from sqlalchemy.pool import StaticPool
 from middlewares import register_middlewares
 from authentication import get_current_user
 from config import Settings, get_settings
+from circuit_breaker import CircuitBreaker
+from circuit_breaker_dependencies import (
+    get_external_service_circuit_breaker,
+)
 from database_models import UserRecord
 from dependencies import get_session
 from routers.health import router as health_router
@@ -53,6 +57,11 @@ def client() -> Generator[TestClient, None, None]:
         window_seconds=60,
     )
 
+    test_external_service_circuit_breaker = CircuitBreaker(
+        failure_threshold=2,
+        recovery_timeout=30.0,
+    )
+
     def override_get_login_rate_limiter(
     ) -> FixedWindowRateLimiter:
         return test_login_rate_limiter
@@ -86,6 +95,10 @@ def client() -> Generator[TestClient, None, None]:
         ],
         external_service_max_attempts=1,
         external_service_base_delay=0.0,
+        external_service_max_delay=0.0,
+        external_service_total_timeout=1.0,
+        external_service_failure_threshold=2,
+        external_service_recovery_timeout=30.0,
     )
 
     test_app = FastAPI()
@@ -101,6 +114,10 @@ def client() -> Generator[TestClient, None, None]:
     def override_get_settings() -> Settings:
         return test_settings
 
+    def override_get_external_service_circuit_breaker(
+    ) -> CircuitBreaker:
+        return test_external_service_circuit_breaker
+
     test_app.dependency_overrides[
         get_session
     ] = override_get_session
@@ -112,6 +129,10 @@ def client() -> Generator[TestClient, None, None]:
     test_app.dependency_overrides[
         get_login_rate_limiter
     ] = override_get_login_rate_limiter
+
+    test_app.dependency_overrides[
+        get_external_service_circuit_breaker
+    ] = override_get_external_service_circuit_breaker
 
     try:
         with TestClient(test_app) as client:
@@ -158,3 +179,4 @@ def task_client(
             get_current_user,
             None,
         )
+

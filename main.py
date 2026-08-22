@@ -5,6 +5,7 @@ from routers.auth import router as auth_router
 from routers.health import router as health_router
 
 from config import get_settings
+from circuit_breaker import CircuitBreaker
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from routers.external import router as external_router
@@ -20,6 +21,19 @@ from exception_handlers import (
 async def lifespan(
     app: FastAPI,
 ) -> AsyncGenerator[None]:
+    settings = get_settings()
+
+    app.state.external_service_circuit_breaker = (
+        CircuitBreaker(
+            failure_threshold=(
+                settings.external_service_failure_threshold
+            ),
+            recovery_timeout=(
+                settings.external_service_recovery_timeout
+            ),
+        )
+    )
+
     timeout = httpx.Timeout(
         connect=3.0,
         read=5.0,

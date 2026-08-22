@@ -38,6 +38,26 @@ class Settings(BaseSettings):
         ge=0.0,
         le=10.0,
     )
+    external_service_max_delay: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=30.0,
+    )
+    external_service_total_timeout: float = Field(
+        default=15.0,
+        gt=0.0,
+        le=60.0,
+    )
+    external_service_failure_threshold: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+    )
+    external_service_recovery_timeout: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=300.0,
+    )
 
 
 @lru_cache

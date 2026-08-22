@@ -4,7 +4,10 @@ import httpx
 
 import pytest
 
-from retrying import retry_http_operation
+from retrying import (
+    RetryBudgetExceededError,
+    retry_http_operation,
+)
 
 def disable_jitter(
     maximum_delay: float,
@@ -304,3 +307,57 @@ def test_retry_http_operation_caps_delay(
         3.0,
         3.0,
     ]
+
+def test_retry_http_operation_stops_when_budget_expires(
+) -> None:
+    attempt_count = 0
+
+    async def operation() -> int:
+        nonlocal attempt_count
+        attempt_count += 1
+
+        request = httpx.Request(
+            "GET",
+            "https://upstream.test/health",
+        )
+
+        raise httpx.ReadTimeout(
+            "Upstream service timed out",
+            request=request,
+        )
+
+    with pytest.raises(
+        RetryBudgetExceededError,
+    ) as exception_info:
+        asyncio.run(
+            retry_http_operation(
+                operation=operation,
+                max_attempts=5,
+                base_delay=1.0,
+                max_delay=1.0,
+                total_timeout=0.01,
+                jitter_function=disable_jitter,
+            )
+        )
+
+    assert str(exception_info.value) == (
+        "Retry time budget exceeded"
+    )
+
+    assert attempt_count == 1
+
+def test_retry_http_operation_rejects_negative_max_delay(
+) -> None:
+    async def operation() -> int:
+        return 200
+
+    with pytest.raises(
+        ValueError,
+        match="max_delay cannot be negative",
+    ):
+        asyncio.run(
+            retry_http_operation(
+                operation=operation,
+                max_delay=-1.0,
+            )
+        )
