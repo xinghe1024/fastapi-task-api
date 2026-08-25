@@ -19,15 +19,45 @@ from dependencies import get_session
 from routers.health import router as health_router
 from routers.tasks import router as task_router
 from routers.auth import router as auth_router
+from redis_dependencies import get_redis_client
 from database import (
     Base,
     enable_sqlite_foreign_keys,
 )
-from rate_limit_dependencies import (
-    get_login_rate_limiter,
-)
-from rate_limiting import FixedWindowRateLimiter
 from routers.external import router as external_router
+
+class AvailableRedisClient:
+    def __init__(self) -> None:
+        self._request_counts: dict[str, int] = {}
+
+    async def ping(self) -> bool:
+        return True
+
+    async def eval(
+        self,
+        _script: str,
+        number_of_keys: int,
+        *keys_and_arguments: object,
+    ) -> list[int]:
+        assert number_of_keys == 1
+
+        redis_key = str(keys_and_arguments[0])
+        window_seconds = int(
+            keys_and_arguments[1],
+        )
+
+        request_count = (
+            self._request_counts.get(redis_key, 0)
+            + 1
+        )
+        self._request_counts[
+            redis_key
+        ] = request_count
+
+        return [
+            request_count,
+            window_seconds,
+        ]
 
 @pytest.fixture
 def client() -> Generator[TestClient, None, None]:
@@ -52,19 +82,16 @@ def client() -> Generator[TestClient, None, None]:
         bind=test_engine,
     )
 
-    test_login_rate_limiter = FixedWindowRateLimiter(
-        request_limit=5,
-        window_seconds=60,
-    )
-
     test_external_service_circuit_breaker = CircuitBreaker(
         failure_threshold=2,
         recovery_timeout=30.0,
     )
 
-    def override_get_login_rate_limiter(
-    ) -> FixedWindowRateLimiter:
-        return test_login_rate_limiter
+    available_redis_client = AvailableRedisClient()
+
+    def override_get_redis_client(
+    ) -> AvailableRedisClient:
+        return available_redis_client
 
     def override_get_session() -> Generator[
         Session,
@@ -99,6 +126,8 @@ def client() -> Generator[TestClient, None, None]:
         external_service_total_timeout=1.0,
         external_service_failure_threshold=2,
         external_service_recovery_timeout=30.0,
+        login_rate_limit=5,
+        login_rate_window_seconds=60,
     )
 
     test_app = FastAPI()
@@ -106,6 +135,9 @@ def client() -> Generator[TestClient, None, None]:
         test_app,
         test_settings.cors_allowed_origins,
     )
+    test_app.dependency_overrides[
+        get_redis_client
+    ] = override_get_redis_client
     test_app.include_router(task_router)
     test_app.include_router(auth_router)
     test_app.include_router(health_router)
@@ -125,10 +157,6 @@ def client() -> Generator[TestClient, None, None]:
     test_app.dependency_overrides[
         get_settings
     ] = override_get_settings
-
-    test_app.dependency_overrides[
-        get_login_rate_limiter
-    ] = override_get_login_rate_limiter
 
     test_app.dependency_overrides[
         get_external_service_circuit_breaker

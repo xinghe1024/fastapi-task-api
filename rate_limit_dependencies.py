@@ -6,25 +6,39 @@ from fastapi import (
     Request,
     status,
 )
+from redis.asyncio import Redis
 
-from rate_limiting import FixedWindowRateLimiter
-
-
-_login_rate_limiter = FixedWindowRateLimiter(
-    request_limit=5,
-    window_seconds=60,
+from config import Settings, get_settings
+from redis_dependencies import get_redis_client
+from redis_rate_limiting import (
+    RedisFixedWindowRateLimiter,
 )
 
 
 def get_login_rate_limiter(
-) -> FixedWindowRateLimiter:
-    return _login_rate_limiter
+    redis_client: Annotated[
+        Redis,
+        Depends(get_redis_client),
+    ],
+    settings: Annotated[
+        Settings,
+        Depends(get_settings),
+    ],
+) -> RedisFixedWindowRateLimiter:
+    return RedisFixedWindowRateLimiter(
+        redis_client=redis_client,
+        request_limit=settings.login_rate_limit,
+        window_seconds=(
+            settings.login_rate_window_seconds
+        ),
+        key_prefix="rate_limit:login",
+    )
 
 
-def enforce_login_rate_limit(
+async def enforce_login_rate_limit(
     request: Request,
     rate_limiter: Annotated[
-        FixedWindowRateLimiter,
+        RedisFixedWindowRateLimiter,
         Depends(get_login_rate_limiter),
     ],
 ) -> None:
@@ -34,7 +48,7 @@ def enforce_login_rate_limit(
         else "unknown"
     )
 
-    retry_after_seconds = rate_limiter.check(
+    retry_after_seconds = await rate_limiter.check(
         client_host,
     )
 

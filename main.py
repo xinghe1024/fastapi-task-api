@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from routers.tasks import router as task_router
 from routers.auth import router as auth_router
 from routers.health import router as health_router
+from redis.asyncio import Redis
 
 from config import get_settings
 from circuit_breaker import CircuitBreaker
@@ -22,6 +23,14 @@ async def lifespan(
     app: FastAPI,
 ) -> AsyncGenerator[None]:
     settings = get_settings()
+
+    redis_client = Redis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_connect_timeout=2.0,
+        socket_timeout=2.0,
+    )
+    app.state.redis_client = redis_client
 
     app.state.external_service_circuit_breaker = (
         CircuitBreaker(
@@ -48,6 +57,7 @@ async def lifespan(
             app.state.http_client = http_client
             yield
     finally:
+        await redis_client.aclose()
         engine.dispose()
 
 

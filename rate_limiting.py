@@ -4,6 +4,7 @@ from math import ceil
 from threading import Lock
 from time import monotonic
 
+
 @dataclass
 class FixedWindow:
     started_at: float
@@ -33,9 +34,9 @@ class FixedWindowRateLimiter:
             window = self._windows.get(client_key)
 
             if (
-                    window is None
-                    or current_time - window.started_at
-                    >= self._window_seconds
+                window is None
+                or current_time - window.started_at
+                >= self._window_seconds
             ):
                 self._windows[client_key] = FixedWindow(
                     started_at=current_time,
@@ -49,7 +50,13 @@ class FixedWindowRateLimiter:
 
             retry_after_seconds = ceil(
                 self._window_seconds
-                - (current_time - window.started_at)
+                - (
+                    current_time
+                    - window.started_at
+                )
             )
-            return max(1, retry_after_seconds)
 
+            return max(
+                1,
+                retry_after_seconds,
+            )

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     external_service_url: str = "https://example.com"
     database_url: str = "sqlite:///./test.db"
+    redis_url: str = "redis://127.0.0.1:6379/0"
     jwt_secret_key: SecretStr
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = Field(
@@ -57,6 +58,16 @@ class Settings(BaseSettings):
         default=30.0,
         gt=0.0,
         le=300.0,
+    )
+    login_rate_limit: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+    )
+    login_rate_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
     )
 
 

@@ -7,6 +7,11 @@ from fastapi import (
     HTTPException,
     status,
 )
+
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+from redis_dependencies import get_redis_client
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -46,5 +51,25 @@ def check_readiness(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database unavailable",
         ) from database_error
+
+    return HealthResponse(status="ok")
+
+@router.get(
+    "/redis",
+    response_model=HealthResponse,
+)
+async def check_redis_health(
+    redis_client: Annotated[
+        Redis,
+        Depends(get_redis_client),
+    ],
+) -> HealthResponse:
+    try:
+        await redis_client.ping()
+    except RedisError as redis_error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis unavailable",
+        ) from redis_error
 
     return HealthResponse(status="ok")
