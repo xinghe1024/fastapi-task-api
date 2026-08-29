@@ -2,6 +2,22 @@ from fastapi.testclient import TestClient
 import pytest
 import logging
 
+from unittest.mock import (
+    AsyncMock,
+    MagicMock,
+    patch,
+)
+
+from redis.exceptions import RedisError
+from authentication import get_current_user
+from models import TaskResponse
+from task_cache import (
+    TaskCache,
+    TaskCacheLookup,
+)
+from task_cache_dependencies import get_task_cache
+
+
 def test_database_starts_emty(
         task_client: TestClient,
 ) -> None:
@@ -105,6 +121,13 @@ def test_patch_task_persists_changes(
     created_task = create_task_for_test(task_client)
     task_id = created_task['id']
 
+    cached_response = task_client.get(
+        f"/tasks/{task_id}",
+    )
+    assert cached_response.status_code == 200
+    assert cached_response.json() == created_task
+
+
     patch_response = task_client.patch(
         f"/tasks/{task_id}",
         json = {
@@ -132,6 +155,14 @@ def test_delete_task_removes_task(
 ) -> None:
     created_task = create_task_for_test(task_client)
     task_id = created_task['id']
+
+    cached_response = task_client.get(
+        f"/tasks/{task_id}",
+    )
+
+    assert cached_response.status_code == 200
+    assert cached_response.json() == created_task
+
     delete_response = task_client.delete(
         f"/tasks/{task_id}",
     )
@@ -310,3 +341,203 @@ def test_create_task_rejects_nonexistent_due_date(
 
     assert read_response.status_code == 200
     assert read_response.json() == []
+
+def test_get_task_returns_cached_task(
+    task_client: TestClient,
+) -> None:
+    cached_task = TaskResponse(
+        id=999,
+        title="Cached task",
+        description=None,
+        priority=2,
+        completed=False,
+        due_date=None,
+    )
+
+    task_cache = MagicMock(spec=TaskCache)
+    task_cache.lookup_task = AsyncMock(
+        return_value=TaskCacheLookup(
+            cache_hit=True,
+            task=cached_task,
+        ),
+    )
+    task_cache.set_task = AsyncMock()
+
+    def override_get_task_cache() -> TaskCache:
+        return task_cache
+
+    task_client.app.dependency_overrides[
+        get_task_cache
+    ] = override_get_task_cache
+
+    try:
+        response = task_client.get(
+            "/tasks/999",
+        )
+    finally:
+        task_client.app.dependency_overrides.pop(
+            get_task_cache,
+            None,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == (
+        cached_task.model_dump(mode="json")
+    )
+
+    current_user = (
+        task_client.app.dependency_overrides[
+            get_current_user
+        ]()
+    )
+
+    task_cache.lookup_task.assert_awaited_once_with(
+        current_user.id,
+        999,
+    )
+    task_cache.set_task.assert_not_awaited()
+
+
+def test_get_task_falls_back_to_database_when_cache_unavailable(
+    task_client: TestClient,
+) -> None:
+    created_task = create_task_for_test(
+        task_client,
+    )
+    task_id = int(created_task["id"])
+
+    task_cache = MagicMock(spec=TaskCache)
+    task_cache.lookup_task = AsyncMock(
+        side_effect=RedisError(
+            "Redis read failed",
+        ),
+    )
+    task_cache.set_task = AsyncMock(
+        side_effect=RedisError(
+            "Redis write failed",
+        ),
+    )
+
+    def override_unavailable_task_cache(
+    ) -> TaskCache:
+        return task_cache
+
+    task_client.app.dependency_overrides[
+        get_task_cache
+    ] = override_unavailable_task_cache
+
+    try:
+        response = task_client.get(
+            f"/tasks/{task_id}",
+        )
+    finally:
+        task_client.app.dependency_overrides.pop(
+            get_task_cache,
+            None,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == created_task
+
+    current_user = (
+        task_client.app.dependency_overrides[
+            get_current_user
+        ]()
+    )
+
+    task_cache.lookup_task.assert_awaited_once_with(
+        current_user.id,
+        task_id,
+    )
+    task_cache.set_task.assert_awaited_once()
+
+
+def test_patch_task_succeeds_when_cache_invalidation_fails(
+    task_client: TestClient,
+) -> None:
+    created_task = create_task_for_test(
+        task_client,
+    )
+    task_id = int(created_task["id"])
+
+    task_cache = MagicMock(spec=TaskCache)
+    task_cache.delete_task = AsyncMock(
+        side_effect=RedisError(
+            "Redis delete failed",
+        ),
+    )
+
+    def override_unavailable_task_cache(
+    ) -> TaskCache:
+        return task_cache
+
+    task_client.app.dependency_overrides[
+        get_task_cache
+    ] = override_unavailable_task_cache
+
+    try:
+        patch_response = task_client.patch(
+            f"/tasks/{task_id}",
+            json={
+                "completed": True,
+            },
+        )
+    finally:
+        task_client.app.dependency_overrides.pop(
+            get_task_cache,
+            None,
+        )
+
+    assert patch_response.status_code == 200
+    updated_task = patch_response.json()
+    assert updated_task["completed"] is True
+
+    current_user = (
+        task_client.app.dependency_overrides[
+            get_current_user
+        ]()
+    )
+
+    task_cache.delete_task.assert_awaited_once_with(
+        current_user.id,
+        task_id,
+    )
+
+    list_response = task_client.get("/tasks")
+
+    assert list_response.status_code == 200
+    assert list_response.json() == [
+        updated_task,
+    ]
+
+def test_negative_cache_skips_database_and_is_invalidated_on_create(
+    task_client: TestClient,
+) -> None:
+    first_response = task_client.get(
+        "/tasks/1",
+    )
+
+    assert first_response.status_code == 404
+
+    with patch(
+        "task_cache_dependencies.find_owned_task",
+    ) as find_owned_task_mock:
+        second_response = task_client.get(
+            "/tasks/1",
+        )
+
+    assert second_response.status_code == 404
+    find_owned_task_mock.assert_not_called()
+
+    created_task = create_task_for_test(
+        task_client,
+    )
+
+    assert created_task["id"] == 1
+
+    read_response = task_client.get(
+        "/tasks/1",
+    )
+
+    assert read_response.status_code == 200
+    assert read_response.json() == created_task

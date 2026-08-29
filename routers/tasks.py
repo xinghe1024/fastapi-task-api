@@ -22,6 +22,12 @@ from dependencies import (
 from task_dependencies import (
     get_owned_task_or_404,
 )
+from task_cache import TaskCache
+from task_cache_dependencies import (
+    get_cached_owned_task_or_404,
+    get_task_cache,
+    invalidate_cached_task,
+)
 
 router = APIRouter(
     prefix="/tasks",
@@ -46,6 +52,10 @@ def create_task(
         Session,
         Depends(get_session),
     ],
+    task_cache: Annotated[
+        TaskCache,
+        Depends(get_task_cache),
+    ],
 ) -> TaskResponse:
     task_record = TaskRecord(
         **task_create.model_dump(),
@@ -56,6 +66,11 @@ def create_task(
     session.add(task_record)
     session.commit()
     session.refresh(task_record)
+    invalidate_cached_task(
+        task_cache=task_cache,
+        owner_id=current_user.id,
+        task_id=task_record.id,
+    )
     background_tasks.add_task(
         log_task_created,
         task_record.id,
@@ -106,18 +121,16 @@ def get_tasks(
     status_code=status.HTTP_200_OK,
 )
 def get_task(
-    stored_task: Annotated[
-        TaskRecord,
-        Depends(get_owned_task_or_404),
+    cached_task: Annotated[
+        TaskResponse,
+        Depends(get_cached_owned_task_or_404),
     ],
 ) -> TaskResponse:
-    return TaskResponse.model_validate(
-        stored_task,
-    )
+    return cached_task
 
 
 @router.patch(
-    '/{task_id}',
+    "/{task_id}",
     status_code=status.HTTP_200_OK,
 )
 def update_task(
@@ -126,14 +139,22 @@ def update_task(
         TaskRecord,
         Depends(get_owned_task_or_404),
     ],
-        session: Annotated[
-            Session,
-            Depends(get_session),
-        ]
+    session: Annotated[
+        Session,
+        Depends(get_session),
+    ],
+    task_cache: Annotated[
+        TaskCache,
+        Depends(get_task_cache),
+    ],
 ) -> TaskResponse:
+    owner_id = stored_task.owner_id
+    task_id = stored_task.id
+
     update_data = task_update.model_dump(
         exclude_unset=True,
     )
+
     for field_name, field_value in update_data.items():
         setattr(
             stored_task,
@@ -142,6 +163,13 @@ def update_task(
         )
 
     session.commit()
+
+    invalidate_cached_task(
+        task_cache=task_cache,
+        owner_id=owner_id,
+        task_id=task_id,
+    )
+
     session.refresh(stored_task)
 
     return TaskResponse.model_validate(
@@ -162,6 +190,19 @@ def delete_task(
         Session,
         Depends(get_session),
     ],
+    task_cache: Annotated[
+        TaskCache,
+        Depends(get_task_cache),
+    ],
 ) -> None:
+    owner_id = stored_task.owner_id
+    task_id = stored_task.id
+
     session.delete(stored_task)
     session.commit()
+
+    invalidate_cached_task(
+        task_cache=task_cache,
+        owner_id=owner_id,
+        task_id=task_id,
+    )

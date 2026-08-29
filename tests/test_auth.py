@@ -1,5 +1,25 @@
 import pytest
 from fastapi.testclient import TestClient
+from redis.exceptions import RedisError
+
+from redis_dependencies import get_redis_client
+
+class UnavailableRedisClient:
+    async def eval(
+        self,
+        *_arguments: object,
+    ) -> list[int]:
+        raise RedisError("Redis is unavailable")
+
+class BrokenRedisClient:
+    async def eval(
+        self,
+        *_arguments: object,
+    ) -> list[int]:
+        raise RuntimeError(
+            "Unexpected programming error",
+        )
+
 
 def test_current_user_requires_token(
     client: TestClient,
@@ -234,3 +254,94 @@ def test_login_rate_limit_rejects_sixth_attempt(
     )
 
     assert 1 <= retry_after_seconds <= 60
+
+
+def test_login_rate_limit_falls_back_when_redis_unavailable(
+    client: TestClient,
+) -> None:
+    unavailable_redis_client = (
+        UnavailableRedisClient()
+    )
+
+    def override_unavailable_redis_client(
+    ) -> UnavailableRedisClient:
+        return unavailable_redis_client
+
+    original_override = (
+        client.app.dependency_overrides[
+            get_redis_client
+        ]
+    )
+
+    client.app.dependency_overrides[
+        get_redis_client
+    ] = override_unavailable_redis_client
+
+    login_payload = {
+        "username": "unknown-user",
+        "password": "wrong-password",
+    }
+
+    try:
+        for _ in range(5):
+            response = client.post(
+                "/auth/token",
+                data=login_payload,
+            )
+
+            assert response.status_code == 401
+
+        limited_response = client.post(
+            "/auth/token",
+            data=login_payload,
+        )
+    finally:
+        client.app.dependency_overrides[
+            get_redis_client
+        ] = original_override
+
+    assert limited_response.status_code == 429
+    assert limited_response.json() == {
+        "detail": "Too many login attempts",
+    }
+
+    retry_after_seconds = int(
+        limited_response.headers["retry-after"]
+    )
+    assert 1 <= retry_after_seconds <= 60
+
+def test_login_rate_limiter_does_not_hide_unexpected_errors(
+    client: TestClient,
+) -> None:
+    broken_redis_client = BrokenRedisClient()
+
+    def override_broken_redis_client(
+    ) -> BrokenRedisClient:
+        return broken_redis_client
+
+    original_override = (
+        client.app.dependency_overrides[
+            get_redis_client
+        ]
+    )
+
+    client.app.dependency_overrides[
+        get_redis_client
+    ] = override_broken_redis_client
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="Unexpected programming error",
+        ):
+            client.post(
+                "/auth/token",
+                data={
+                    "username": "alice",
+                    "password": "wrong-password",
+                },
+            )
+    finally:
+        client.app.dependency_overrides[
+            get_redis_client
+        ] = original_override

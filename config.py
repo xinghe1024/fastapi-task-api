@@ -69,6 +69,21 @@ class Settings(BaseSettings):
         ge=1,
         le=3600,
     )
+    task_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=1,
+        le=86400,
+    )
+    task_negative_cache_ttl_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+    )
+    task_cache_ttl_jitter_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=3600,
+    )
 
 
 @lru_cache

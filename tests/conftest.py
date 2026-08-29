@@ -16,6 +16,10 @@ from circuit_breaker_dependencies import (
 )
 from database_models import UserRecord
 from dependencies import get_session
+from rate_limiting import FixedWindowRateLimiter
+from rate_limit_dependencies import (
+    get_fallback_login_rate_limiter,
+)
 from routers.health import router as health_router
 from routers.tasks import router as task_router
 from routers.auth import router as auth_router
@@ -29,6 +33,7 @@ from routers.external import router as external_router
 class AvailableRedisClient:
     def __init__(self) -> None:
         self._request_counts: dict[str, int] = {}
+        self._cached_values: dict[str, str] = {}
 
     async def ping(self) -> bool:
         return True
@@ -58,6 +63,32 @@ class AvailableRedisClient:
             request_count,
             window_seconds,
         ]
+
+    async def get(
+            self,
+            key: str,
+    ) -> str | None:
+        return self._cached_values.get(key)
+
+    async def set(
+            self,
+            key: str,
+            value: str,
+            *,
+            ex: int,
+    ) -> bool:
+        self._cached_values[key] = value
+        return True
+
+    async def delete(
+            self,
+            key: str,
+    ) -> int:
+        if key not in self._cached_values:
+            return 0
+
+        del self._cached_values[key]
+        return 1
 
 @pytest.fixture
 def client() -> Generator[TestClient, None, None]:
@@ -89,9 +120,20 @@ def client() -> Generator[TestClient, None, None]:
 
     available_redis_client = AvailableRedisClient()
 
+    fallback_login_rate_limiter = (
+        FixedWindowRateLimiter(
+            request_limit=5,
+            window_seconds=60,
+        )
+    )
+
     def override_get_redis_client(
     ) -> AvailableRedisClient:
         return available_redis_client
+
+    def override_get_fallback_login_rate_limiter(
+    ) -> FixedWindowRateLimiter:
+        return fallback_login_rate_limiter
 
     def override_get_session() -> Generator[
         Session,
@@ -138,6 +180,11 @@ def client() -> Generator[TestClient, None, None]:
     test_app.dependency_overrides[
         get_redis_client
     ] = override_get_redis_client
+
+    test_app.dependency_overrides[
+        get_fallback_login_rate_limiter
+    ] = override_get_fallback_login_rate_limiter
+
     test_app.include_router(task_router)
     test_app.include_router(auth_router)
     test_app.include_router(health_router)

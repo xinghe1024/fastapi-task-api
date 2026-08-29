@@ -20,11 +20,11 @@ def get_owned_task_or_404(
         Depends(get_session),
     ],
 ) -> TaskRecord:
-    statement = select(TaskRecord).where(
-        TaskRecord.id == task_id,
-        TaskRecord.owner_id == current_user.id,
+    task_record = find_owned_task(
+        session=session,
+        task_id=task_id,
+        owner_id=current_user.id,
     )
-    task_record = session.scalar(statement)
 
     if task_record is None:
         raise HTTPException(
@@ -33,3 +33,15 @@ def get_owned_task_or_404(
         )
 
     return task_record
+
+def find_owned_task(
+    session: Session,
+    task_id: int,
+    owner_id: int,
+) -> TaskRecord | None:
+    statement = select(TaskRecord).where(
+        TaskRecord.id == task_id,
+        TaskRecord.owner_id == owner_id,
+    )
+
+    return session.scalar(statement)

@@ -10,6 +10,7 @@ from circuit_breaker import CircuitBreaker
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from routers.external import router as external_router
+from rate_limiting import FixedWindowRateLimiter
 
 from database import engine
 from middlewares import register_middlewares
@@ -31,6 +32,15 @@ async def lifespan(
         socket_timeout=2.0,
     )
     app.state.redis_client = redis_client
+
+    app.state.fallback_login_rate_limiter = (
+        FixedWindowRateLimiter(
+            request_limit=settings.login_rate_limit,
+            window_seconds=(
+                settings.login_rate_window_seconds
+            ),
+        )
+    )
 
     app.state.external_service_circuit_breaker = (
         CircuitBreaker(
