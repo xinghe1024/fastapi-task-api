@@ -16,6 +16,7 @@ from circuit_breaker_dependencies import (
 )
 from database_models import UserRecord
 from dependencies import get_session
+from redis_lock import RELEASE_LOCK_SCRIPT
 from rate_limiting import FixedWindowRateLimiter
 from rate_limit_dependencies import (
     get_fallback_login_rate_limiter,
@@ -30,6 +31,8 @@ from database import (
 )
 from routers.external import router as external_router
 
+
+
 class AvailableRedisClient:
     def __init__(self) -> None:
         self._request_counts: dict[str, int] = {}
@@ -39,25 +42,40 @@ class AvailableRedisClient:
         return True
 
     async def eval(
-        self,
-        _script: str,
-        number_of_keys: int,
-        *keys_and_arguments: object,
-    ) -> list[int]:
+            self,
+            script: str,
+            number_of_keys: int,
+            *keys_and_arguments: object,
+    ) -> list[int] | int:
         assert number_of_keys == 1
+        assert len(keys_and_arguments) >= 2
 
+        # 模拟 Redis 的释放锁 Lua 脚本
+        if script == RELEASE_LOCK_SCRIPT:
+            lock_key = str(keys_and_arguments[0])
+            lock_token = str(keys_and_arguments[1])
+
+            # 只有锁的持有者才能释放锁
+            if (
+                    self._cached_values.get(lock_key)
+                    != lock_token
+            ):
+                return 0
+
+            del self._cached_values[lock_key]
+            return 1
+
+        # 模拟固定窗口限流 Lua 脚本
         redis_key = str(keys_and_arguments[0])
         window_seconds = int(
             keys_and_arguments[1],
         )
 
         request_count = (
-            self._request_counts.get(redis_key, 0)
-            + 1
+                self._request_counts.get(redis_key, 0)
+                + 1
         )
-        self._request_counts[
-            redis_key
-        ] = request_count
+        self._request_counts[redis_key] = request_count
 
         return [
             request_count,
@@ -76,7 +94,11 @@ class AvailableRedisClient:
             value: str,
             *,
             ex: int,
-    ) -> bool:
+            nx: bool = False,
+    ) -> bool | None:
+        if nx and key in self._cached_values:
+            return None
+
         self._cached_values[key] = value
         return True
 

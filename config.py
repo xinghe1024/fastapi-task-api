@@ -84,6 +84,21 @@ class Settings(BaseSettings):
         ge=0,
         le=3600,
     )
+    task_cache_lock_ttl_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+    )
+    task_cache_lock_wait_attempts: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+    )
+    task_cache_lock_wait_seconds: float = Field(
+        default=0.05,
+        gt=0.0,
+        le=1.0,
+    )
 
 
 @lru_cache

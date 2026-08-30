@@ -1,13 +1,17 @@
+from asyncio import sleep
+
+from collections.abc import Awaitable, Callable
+from collections.abc import Callable
+
+from dataclasses import dataclass
+
 from redis.asyncio import Redis
 
-from collections.abc import Callable
 from random import randint
 
 from pydantic import ValidationError
 
 from models import TaskResponse
-
-from dataclasses import dataclass
 
 
 TASK_NOT_FOUND_CACHE_MARKER = "__task_not_found__"
@@ -55,6 +59,44 @@ class TaskCache:
         self._negative_ttl_seconds = (
             negative_ttl_seconds
         )
+
+    async def wait_for_task_cache_fill(
+            task_cache: TaskCache,
+            owner_id: int,
+            task_id: int,
+            attempts: int,
+            delay_seconds: float,
+            sleeper: Callable[
+                [float],
+                Awaitable[None],
+            ] = sleep,
+    ) -> TaskCacheLookup:
+        if attempts < 1:
+            raise ValueError(
+                "attempts must be at least 1",
+            )
+
+        if delay_seconds < 0:
+            raise ValueError(
+                "delay_seconds cannot be negative",
+            )
+
+        for _ in range(attempts):
+            await sleeper(delay_seconds)
+
+            cache_lookup = await task_cache.lookup_task(
+                owner_id=owner_id,
+                task_id=task_id,
+            )
+
+            if cache_lookup.cache_hit:
+                return cache_lookup
+
+        return TaskCacheLookup(
+            cache_hit=False,
+            task=None,
+        )
+
 
     @staticmethod
     def _build_key(
@@ -173,3 +215,39 @@ class TaskCache:
             ex=self._negative_ttl_seconds,
         )
 
+async def wait_for_task_cache_fill(
+    task_cache: TaskCache,
+    owner_id: int,
+    task_id: int,
+    attempts: int,
+    delay_seconds: float,
+    sleeper: Callable[
+        [float],
+        Awaitable[None],
+    ] = sleep,
+) -> TaskCacheLookup:
+    if attempts < 1:
+        raise ValueError(
+            "attempts must be at least 1",
+        )
+
+    if delay_seconds < 0:
+        raise ValueError(
+            "delay_seconds cannot be negative",
+        )
+
+    for _ in range(attempts):
+        await sleeper(delay_seconds)
+
+        cache_lookup = await task_cache.lookup_task(
+            owner_id=owner_id,
+            task_id=task_id,
+        )
+
+        if cache_lookup.cache_hit:
+            return cache_lookup
+
+    return TaskCacheLookup(
+        cache_hit=False,
+        task=None,
+    )

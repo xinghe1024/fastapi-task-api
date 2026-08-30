@@ -4,13 +4,22 @@ import logging
 from typing import Annotated
 
 from config import Settings, get_settings
-from redis_dependencies import get_redis_client
-from task_cache import TaskCache
+
+from task_cache import (
+    TaskCache,
+    TaskCacheLookup,
+    wait_for_task_cache_fill,
+)
 
 from anyio import from_thread
+
 from fastapi import Depends, HTTPException, status
+
+from redis_lock import RedisLock
+from redis_dependencies import get_redis_client
 from redis.exceptions import RedisError
 from redis.asyncio import Redis
+
 from sqlalchemy.orm import Session
 
 from authentication import get_current_user
@@ -44,58 +53,40 @@ def get_task_cache(
         ),
     )
 
-def get_cached_owned_task_or_404(
+def build_task_cache_lock_key(
+    owner_id: int,
     task_id: int,
-    current_user: Annotated[
-        UserRecord,
-        Depends(get_current_user),
-    ],
-    session: Annotated[
-        Session,
-        Depends(get_session),
-    ],
-    task_cache: Annotated[
-        TaskCache,
-        Depends(get_task_cache),
-    ],
+) -> str:
+    return f"lock:task:{owner_id}:{task_id}"
+
+def resolve_cached_task(
+    cache_lookup: TaskCacheLookup,
 ) -> TaskResponse:
-    cache_lookup = None
-
-    try:
-        cache_lookup = from_thread.run(
-            task_cache.lookup_task,
-            current_user.id,
-            task_id,
-        )
-    except RedisError:
-        logger.warning(
-            "Redis task cache unavailable; "
-            "querying database",
+    if cache_lookup.task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
         )
 
-    if (
-        cache_lookup is not None
-        and cache_lookup.cache_hit
-    ):
-        if cache_lookup.task is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Task not found",
-            )
+    return cache_lookup.task
 
-        return cache_lookup.task
-
+def load_owned_task_from_database(
+    session: Session,
+    task_cache: TaskCache,
+    owner_id: int,
+    task_id: int,
+) -> TaskResponse:
     task_record = find_owned_task(
         session=session,
         task_id=task_id,
-        owner_id=current_user.id,
+        owner_id=owner_id,
     )
 
     if task_record is None:
         try:
             from_thread.run(
                 task_cache.set_task_not_found,
-                current_user.id,
+                owner_id,
                 task_id,
             )
         except RedisError:
@@ -116,7 +107,7 @@ def get_cached_owned_task_or_404(
     try:
         from_thread.run(
             task_cache.set_task,
-            current_user.id,
+            owner_id,
             task_response,
         )
     except RedisError:
@@ -126,6 +117,139 @@ def get_cached_owned_task_or_404(
         )
 
     return task_response
+
+def get_cached_owned_task_or_404(
+    task_id: int,
+    current_user: Annotated[
+        UserRecord,
+        Depends(get_current_user),
+    ],
+    session: Annotated[
+        Session,
+        Depends(get_session),
+    ],
+    task_cache: Annotated[
+        TaskCache,
+        Depends(get_task_cache),
+    ],
+    cache_lock: Annotated[
+        RedisLock,
+        Depends(get_task_cache_lock),
+    ],
+    settings: Annotated[
+        Settings,
+        Depends(get_settings),
+    ],
+) -> TaskResponse:
+    try:
+        initial_lookup = from_thread.run(
+            task_cache.lookup_task,
+            current_user.id,
+            task_id,
+        )
+    except RedisError:
+        logger.warning(
+            "Redis task cache unavailable; "
+            "querying database",
+        )
+
+        return load_owned_task_from_database(
+            session=session,
+            task_cache=task_cache,
+            owner_id=current_user.id,
+            task_id=task_id,
+        )
+
+    if initial_lookup.cache_hit:
+        return resolve_cached_task(initial_lookup)
+
+    lock_key = build_task_cache_lock_key(
+        owner_id=current_user.id,
+        task_id=task_id,
+    )
+
+    try:
+        lock_token = from_thread.run(
+            cache_lock.acquire,
+            lock_key,
+        )
+    except RedisError:
+        logger.warning(
+            "Redis cache lock unavailable; "
+            "querying database",
+        )
+
+        return load_owned_task_from_database(
+            session=session,
+            task_cache=task_cache,
+            owner_id=current_user.id,
+            task_id=task_id,
+        )
+
+    if lock_token is None:
+        try:
+            waited_lookup = from_thread.run(
+                wait_for_task_cache_fill,
+                task_cache,
+                current_user.id,
+                task_id,
+                settings.task_cache_lock_wait_attempts,
+                settings.task_cache_lock_wait_seconds,
+            )
+        except RedisError:
+            logger.warning(
+                "Redis task cache unavailable "
+                "while waiting; querying database",
+            )
+
+            return load_owned_task_from_database(
+                session=session,
+                task_cache=task_cache,
+                owner_id=current_user.id,
+                task_id=task_id,
+            )
+
+        if waited_lookup.cache_hit:
+            return resolve_cached_task(
+                waited_lookup,
+            )
+
+        return load_owned_task_from_database(
+            session=session,
+            task_cache=task_cache,
+            owner_id=current_user.id,
+            task_id=task_id,
+        )
+
+    try:
+        second_lookup = from_thread.run(
+            task_cache.lookup_task,
+            current_user.id,
+            task_id,
+        )
+
+        if second_lookup.cache_hit:
+            return resolve_cached_task(
+                second_lookup,
+            )
+
+        return load_owned_task_from_database(
+            session=session,
+            task_cache=task_cache,
+            owner_id=current_user.id,
+            task_id=task_id,
+        )
+    finally:
+        try:
+            from_thread.run(
+                cache_lock.release,
+                lock_key,
+                lock_token,
+            )
+        except RedisError:
+            logger.warning(
+                "Redis cache lock could not be released",
+            )
 
 
 def invalidate_cached_task(
@@ -144,3 +268,20 @@ def invalidate_cached_task(
             "Redis task cache unavailable; "
             "cached task was not invalidated",
         )
+
+def get_task_cache_lock(
+    redis_client: Annotated[
+        Redis,
+        Depends(get_redis_client),
+    ],
+    settings: Annotated[
+        Settings,
+        Depends(get_settings),
+    ],
+) -> RedisLock:
+    return RedisLock(
+        redis_client=redis_client,
+        ttl_seconds=(
+            settings.task_cache_lock_ttl_seconds
+        ),
+    )

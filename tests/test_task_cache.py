@@ -10,6 +10,8 @@ from models import TaskResponse
 from task_cache import (
     TASK_NOT_FOUND_CACHE_MARKER,
     TaskCache,
+    TaskCacheLookup,
+    wait_for_task_cache_fill,
 )
 
 
@@ -251,3 +253,67 @@ def test_task_cache_adds_jitter_to_positive_ttl(
         task.model_dump_json(),
         ex=317,
     )
+
+
+def test_wait_for_task_cache_fill_returns_when_cache_is_filled(
+) -> None:
+    task = create_task_response()
+
+    task_cache = MagicMock(spec=TaskCache)
+    task_cache.lookup_task = AsyncMock(
+        side_effect=[
+            TaskCacheLookup(
+                cache_hit=False,
+                task=None,
+            ),
+            TaskCacheLookup(
+                cache_hit=True,
+                task=task,
+            ),
+        ],
+    )
+    sleeper = AsyncMock()
+
+    cache_lookup = asyncio.run(
+        wait_for_task_cache_fill(
+            task_cache=task_cache,
+            owner_id=7,
+            task_id=3,
+            attempts=5,
+            delay_seconds=0.05,
+            sleeper=sleeper,
+        )
+    )
+
+    assert cache_lookup.cache_hit is True
+    assert cache_lookup.task == task
+    assert sleeper.await_count == 2
+    assert task_cache.lookup_task.await_count == 2
+
+
+def test_wait_for_task_cache_fill_stops_after_attempt_limit(
+) -> None:
+    task_cache = MagicMock(spec=TaskCache)
+    task_cache.lookup_task = AsyncMock(
+        return_value=TaskCacheLookup(
+            cache_hit=False,
+            task=None,
+        ),
+    )
+    sleeper = AsyncMock()
+
+    cache_lookup = asyncio.run(
+        wait_for_task_cache_fill(
+            task_cache=task_cache,
+            owner_id=7,
+            task_id=3,
+            attempts=3,
+            delay_seconds=0.05,
+            sleeper=sleeper,
+        )
+    )
+
+    assert cache_lookup.cache_hit is False
+    assert cache_lookup.task is None
+    assert sleeper.await_count == 3
+    assert task_cache.lookup_task.await_count == 3

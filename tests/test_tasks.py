@@ -8,6 +8,7 @@ from unittest.mock import (
     patch,
 )
 
+from redis_lock import RedisLock
 from redis.exceptions import RedisError
 from authentication import get_current_user
 from models import TaskResponse
@@ -15,7 +16,10 @@ from task_cache import (
     TaskCache,
     TaskCacheLookup,
 )
-from task_cache_dependencies import get_task_cache
+from task_cache_dependencies import (
+    get_task_cache,
+    get_task_cache_lock,
+)
 
 
 def test_database_starts_emty(
@@ -541,3 +545,84 @@ def test_negative_cache_skips_database_and_is_invalidated_on_create(
 
     assert read_response.status_code == 200
     assert read_response.json() == created_task
+
+
+def test_cache_miss_acquires_and_releases_lock(
+    task_client: TestClient,
+) -> None:
+    created_task = create_task_for_test(
+        task_client,
+    )
+    task_id = int(created_task["id"])
+
+    task_cache = MagicMock(spec=TaskCache)
+    task_cache.lookup_task = AsyncMock(
+        side_effect=[
+            TaskCacheLookup(
+                cache_hit=False,
+                task=None,
+            ),
+            TaskCacheLookup(
+                cache_hit=False,
+                task=None,
+            ),
+        ],
+    )
+    task_cache.set_task = AsyncMock()
+
+    cache_lock = MagicMock(spec=RedisLock)
+    cache_lock.acquire = AsyncMock(
+        return_value="owner-token",
+    )
+    cache_lock.release = AsyncMock(
+        return_value=True,
+    )
+
+    def override_task_cache() -> TaskCache:
+        return task_cache
+
+    def override_cache_lock() -> RedisLock:
+        return cache_lock
+
+    task_client.app.dependency_overrides[
+        get_task_cache
+    ] = override_task_cache
+    task_client.app.dependency_overrides[
+        get_task_cache_lock
+    ] = override_cache_lock
+
+    try:
+        response = task_client.get(
+            f"/tasks/{task_id}",
+        )
+    finally:
+        task_client.app.dependency_overrides.pop(
+            get_task_cache,
+            None,
+        )
+        task_client.app.dependency_overrides.pop(
+            get_task_cache_lock,
+            None,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == created_task
+
+    current_user = (
+        task_client.app.dependency_overrides[
+            get_current_user
+        ]()
+    )
+    lock_key = (
+        f"lock:task:{current_user.id}:{task_id}"
+    )
+
+    assert task_cache.lookup_task.await_count == 2
+    cache_lock.acquire.assert_awaited_once_with(
+        lock_key,
+    )
+    cache_lock.release.assert_awaited_once_with(
+        lock_key,
+        "owner-token",
+    )
+    task_cache.set_task.assert_awaited_once()
