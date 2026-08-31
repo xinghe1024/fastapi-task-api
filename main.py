@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from routers.tasks import router as task_router
 from routers.auth import router as auth_router
 from routers.health import router as health_router
+from routers.realtime import router as realtime_router
 from redis.asyncio import Redis
 
 from config import get_settings
@@ -82,3 +83,4 @@ app.include_router(task_router)
 app.include_router(auth_router)
 app.include_router(health_router)
 app.include_router(external_router)
+app.include_router(realtime_router)

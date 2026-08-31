@@ -20,6 +20,10 @@ DUMMY_PASSWORD_HASH = hash_password(
     "dummy-password-not-used-for-login",
 )
 
+
+class InvalidCredentialsError(Exception):
+    pass
+
 def authenticate_user(
         session: Session,
         username: str,
@@ -73,6 +77,21 @@ def get_current_user(
     ],
 ) -> UserRecord:
     try:
+        return resolve_user_from_token(
+            token=token,
+            session=session,
+            settings=settings,
+        )
+    except InvalidCredentialsError as error:
+        raise create_credentials_exception() from error
+
+
+def resolve_user_from_token(
+    token: str,
+    session: Session,
+    settings: Settings,
+) -> UserRecord:
+    try:
         subject = decode_access_token(
             token=token,
             settings=settings,
@@ -82,7 +101,7 @@ def get_current_user(
         InvalidTokenError,
         ValueError,
     ) as error:
-        raise create_credentials_exception() from error
+        raise InvalidCredentialsError() from error
 
     user_record = session.get(
         UserRecord,
@@ -93,6 +112,6 @@ def get_current_user(
         user_record is None
         or not user_record.is_active
     ):
-        raise create_credentials_exception()
+        raise InvalidCredentialsError()
 
     return user_record

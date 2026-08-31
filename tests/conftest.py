@@ -16,6 +16,7 @@ from circuit_breaker_dependencies import (
 )
 from database_models import UserRecord
 from dependencies import get_session
+from routers.realtime import router as realtime_router
 from redis_lock import RELEASE_LOCK_SCRIPT
 from rate_limiting import FixedWindowRateLimiter
 from rate_limit_dependencies import (
@@ -211,6 +212,7 @@ def client() -> Generator[TestClient, None, None]:
     test_app.include_router(auth_router)
     test_app.include_router(health_router)
     test_app.include_router(external_router)
+    test_app.include_router(realtime_router)
 
     def override_get_settings() -> Settings:
         return test_settings
