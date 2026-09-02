@@ -89,6 +89,15 @@ class AvailableRedisClient:
     ) -> str | None:
         return self._cached_values.get(key)
 
+    async def getdel(
+            self,
+            key: str,
+    ) -> str | None:
+        return self._cached_values.pop(
+            key,
+            None,
+        )
+
     async def set(
             self,
             key: str,

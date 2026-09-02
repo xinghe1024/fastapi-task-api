@@ -1,18 +1,28 @@
 from fastapi import (
     APIRouter,
+    Depends,
     WebSocket,
     WebSocketDisconnect,
+    status,
 )
 from typing import Annotated
 
-from fastapi import Depends
+from json import JSONDecodeError
+
+from pydantic import ValidationError
 
 
+from connection_manager import ConnectionManager
 from database_models import UserRecord
 from websocket_authentication import (
     get_websocket_current_user,
 )
-from connection_manager import ConnectionManager
+
+from realtime_models import (
+    ClientBroadcastMessage,
+    RealtimeMessageEvent,
+)
+
 
 router = APIRouter(
     prefix="/ws",
@@ -37,23 +47,52 @@ async def echo_messages(
 @router.websocket("/broadcast")
 async def broadcast_messages(
     websocket: WebSocket,
-    _current_user: Annotated[
+    current_user: Annotated[
         UserRecord,
         Depends(get_websocket_current_user),
     ],
 ) -> None:
     await connection_manager.connect(
-        websocket,
+        user_id=current_user.id,
+        websocket=websocket,
     )
 
     try:
         while True:
-            message = await websocket.receive_text()
+            try:
+                payload = await websocket.receive_json()
 
-            await connection_manager.broadcast(
-                message,
+                incoming_message = (
+                    ClientBroadcastMessage.model_validate(
+                        payload,
+                    )
+                )
+            except (
+                JSONDecodeError,
+                ValidationError,
+            ):
+                await websocket.close(
+                    code=(
+                        status.WS_1007_INVALID_FRAME_PAYLOAD_DATA
+                    ),
+                    reason="Invalid message payload",
+                )
+                return
+
+            outgoing_event = RealtimeMessageEvent(
+                content=incoming_message.content,
+            )
+
+            await connection_manager.broadcast_to_user(
+                user_id=current_user.id,
+                message=(
+                    outgoing_event.model_dump_json()
+                ),
             )
     except WebSocketDisconnect:
+        pass
+    finally:
         connection_manager.disconnect(
-            websocket,
+            user_id=current_user.id,
+            websocket=websocket,
         )

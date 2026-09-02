@@ -1,8 +1,8 @@
-from fastapi import Request
 from redis.asyncio import Redis
+from starlette.requests import HTTPConnection
 
 
 def get_redis_client(
-    request: Request,
+    connection: HTTPConnection,
 ) -> Redis:
-    return request.app.state.redis_client
+    return connection.app.state.redis_client

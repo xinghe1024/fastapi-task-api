@@ -345,3 +345,62 @@ def test_login_rate_limiter_does_not_hide_unexpected_errors(
         client.app.dependency_overrides[
             get_redis_client
         ] = original_override
+
+
+def test_authenticated_user_can_issue_websocket_ticket(
+    client: TestClient,
+) -> None:
+    register_response = client.post(
+        "/auth/register",
+        json={
+            "username": "ticket-user",
+            "password": "secure-password",
+        },
+    )
+    assert register_response.status_code == 201
+
+    login_response = client.post(
+        "/auth/token",
+        data={
+            "username": "ticket-user",
+            "password": "secure-password",
+        },
+    )
+    assert login_response.status_code == 200
+
+    access_token = login_response.json()[
+        "access_token"
+    ]
+
+    response = client.post(
+        "/auth/websocket-ticket",
+        headers={
+            "Authorization": (
+                f"Bearer {access_token}"
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+
+    response_body = response.json()
+
+    assert isinstance(
+        response_body["ticket"],
+        str,
+    )
+    assert response_body["ticket"]
+    assert response_body["expires_in"] == 30
+
+
+def test_websocket_ticket_requires_authentication(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/auth/websocket-ticket",
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": "Not authenticated",
+    }

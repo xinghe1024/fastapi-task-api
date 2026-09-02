@@ -2,6 +2,7 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
+
 class UserCreate(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -28,3 +29,14 @@ class UserResponse(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
+
+
+class WebSocketTicketResponse(BaseModel):
+    ticket: Annotated[
+        str,
+        Field(min_length=1),
+    ]
+    expires_in: Annotated[
+        int,
+        Field(ge=1),
+    ]

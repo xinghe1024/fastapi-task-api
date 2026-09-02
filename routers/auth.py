@@ -12,15 +12,6 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from user_models import (
-    TokenResponse,
-    UserCreate,
-    UserResponse,
-)
-
-from rate_limit_dependencies import (
-    enforce_login_rate_limit,
-)
 
 from authentication import (
     authenticate_user,
@@ -35,6 +26,24 @@ from passwords import hash_password
 from user_models import UserCreate, UserResponse
 
 from security import create_access_token, oauth2_scheme
+
+
+from user_models import (
+    TokenResponse,
+    UserCreate,
+    UserResponse,
+    WebSocketTicketResponse,
+)
+
+from rate_limit_dependencies import (
+    enforce_login_rate_limit,
+)
+from redis.exceptions import RedisError
+
+from websocket_ticket_dependencies import (
+    get_websocket_ticket_store,
+)
+from websocket_tickets import WebSocketTicketStore
 
 
 router = APIRouter(
@@ -145,4 +154,44 @@ def login_for_access_token(
     return TokenResponse(
         access_token = access_token,
         token_type = "bearer",
+    )
+
+
+@router.post(
+    "/websocket-ticket",
+    status_code=status.HTTP_201_CREATED,
+)
+async def issue_websocket_ticket(
+    current_user: Annotated[
+        UserRecord,
+        Depends(get_current_user),
+    ],
+    ticket_store: Annotated[
+        WebSocketTicketStore,
+        Depends(get_websocket_ticket_store),
+    ],
+    settings: Annotated[
+        Settings,
+        Depends(get_settings),
+    ],
+) -> WebSocketTicketResponse:
+    try:
+        ticket = await ticket_store.issue(
+            user_id=current_user.id,
+        )
+    except RedisError as error:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            detail=(
+                "WebSocket ticket service unavailable"
+            ),
+        ) from error
+
+    return WebSocketTicketResponse(
+        ticket=ticket,
+        expires_in=(
+            settings.websocket_ticket_ttl_seconds
+        ),
     )

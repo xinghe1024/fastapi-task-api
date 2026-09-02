@@ -36,14 +36,22 @@ def test_broadcast_removes_disconnected_client_and_continues(
 
     async def exercise_manager() -> None:
         await manager.connect(
-            disconnected_websocket,
+            user_id=7,
+            websocket=disconnected_websocket,
         )
         await manager.connect(
-            active_websocket,
+            user_id=7,
+            websocket=active_websocket,
         )
 
-        await manager.broadcast("first message")
-        await manager.broadcast("second message")
+        await manager.broadcast_to_user(
+            user_id=7,
+            message="first message",
+        )
+        await manager.broadcast_to_user(
+            user_id=7,
+            message="second message",
+        )
 
     asyncio.run(exercise_manager())
 
@@ -101,10 +109,19 @@ def test_broadcast_sends_to_connections_concurrently(
             mark_second_send_started
         )
 
-        await manager.connect(first_websocket)
-        await manager.connect(second_websocket)
+        await manager.connect(
+            user_id=7,
+            websocket=first_websocket,
+        )
+        await manager.connect(
+            user_id=7,
+            websocket=second_websocket,
+        )
 
-        await manager.broadcast("task updated")
+        await manager.broadcast_to_user(
+            user_id=7,
+            message="task updated",
+        )
 
     asyncio.run(exercise_manager())
 

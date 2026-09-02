@@ -99,6 +99,11 @@ class Settings(BaseSettings):
         gt=0.0,
         le=1.0,
     )
+    websocket_ticket_ttl_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=300,
+    )
 
 
 @lru_cache
