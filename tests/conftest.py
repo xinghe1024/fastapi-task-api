@@ -1,6 +1,8 @@
-from collections.abc import Generator
-
 import pytest
+
+from collections.abc import Generator
+from connection_manager import ConnectionManager
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
@@ -16,9 +18,11 @@ from circuit_breaker_dependencies import (
 )
 from database_models import UserRecord
 from dependencies import get_session
+
 from routers.realtime import router as realtime_router
 from redis_lock import RELEASE_LOCK_SCRIPT
 from rate_limiting import FixedWindowRateLimiter
+from realtime_models import RealtimeMessageEvent
 from rate_limit_dependencies import (
     get_fallback_login_rate_limiter,
 )
@@ -122,6 +126,37 @@ class AvailableRedisClient:
         del self._cached_values[key]
         return 1
 
+
+class InMemoryRealtimeEventPublisher:
+    def __init__(
+        self,
+        connection_manager: ConnectionManager,
+    ) -> None:
+        self._connection_manager = connection_manager
+        self.published_events: list[
+            tuple[int, RealtimeMessageEvent]
+        ] = []
+
+    async def publish_to_user(
+        self,
+        user_id: int,
+        event: RealtimeMessageEvent,
+    ) -> int:
+        self.published_events.append(
+            (
+                user_id,
+                event,
+            )
+        )
+
+        await self._connection_manager.broadcast_to_user(
+            user_id=user_id,
+            message=event.model_dump_json(),
+        )
+
+        return 1
+
+
 @pytest.fixture
 def client() -> Generator[TestClient, None, None]:
     test_engine = create_engine(
@@ -205,10 +240,24 @@ def client() -> Generator[TestClient, None, None]:
     )
 
     test_app = FastAPI()
+
+    test_connection_manager = ConnectionManager()
+
+    test_app.state.connection_manager = (
+        test_connection_manager
+    )
+
+    test_app.state.realtime_event_publisher = (
+        InMemoryRealtimeEventPublisher(
+            connection_manager=test_connection_manager,
+        )
+    )
+
     register_middlewares(
         test_app,
         test_settings.cors_allowed_origins,
     )
+
     test_app.dependency_overrides[
         get_redis_client
     ] = override_get_redis_client

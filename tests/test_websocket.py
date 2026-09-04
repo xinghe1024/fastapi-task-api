@@ -1,11 +1,24 @@
 import pytest
 
+from realtime_models import RealtimeMessageEvent
+from redis.exceptions import RedisError
 
 from fastapi import (
     WebSocketDisconnect,
     status,
 )
 from fastapi.testclient import TestClient
+
+class UnavailableRealtimeEventPublisher:
+    async def publish_to_user(
+        self,
+        user_id: int,
+        event: RealtimeMessageEvent,
+    ) -> int:
+        raise RedisError(
+            "Redis is unavailable",
+        )
+
 
 def login_and_get_access_token(
     client: TestClient,
@@ -304,3 +317,99 @@ def test_websocket_rejects_extra_message_field(
         == status.WS_1007_INVALID_FRAME_PAYLOAD_DATA
     )
 
+
+def test_websocket_broadcast_uses_event_publisher(
+    client: TestClient,
+) -> None:
+    access_token = login_and_get_access_token(
+        client,
+        username="publisher-test-user",
+    )
+    ticket = issue_websocket_ticket(
+        client,
+        access_token,
+    )
+
+    publisher = (
+        client
+        .app
+        .state
+        .realtime_event_publisher
+    )
+
+    with client.websocket_connect(
+        f"/ws/broadcast?ticket={ticket}",
+    ) as websocket:
+        websocket.send_json(
+            {
+                "content": "published event",
+            },
+        )
+
+        assert websocket.receive_json() == {
+            "type": "message",
+            "content": "published event",
+        }
+
+    assert len(publisher.published_events) == 1
+
+    published_user_id, published_event = (
+        publisher.published_events[0]
+    )
+
+    assert published_user_id >= 1
+    assert published_event == RealtimeMessageEvent(
+        content="published event",
+    )
+
+
+def test_websocket_closes_with_1013_when_publish_fails(
+    client: TestClient,
+) -> None:
+    access_token = login_and_get_access_token(
+        client,
+        username="unavailable-publisher-user",
+    )
+    ticket = issue_websocket_ticket(
+        client,
+        access_token,
+    )
+
+    original_publisher = (
+        client
+        .app
+        .state
+        .realtime_event_publisher
+    )
+
+    client.app.state.realtime_event_publisher = (
+        UnavailableRealtimeEventPublisher()
+    )
+
+    try:
+        with client.websocket_connect(
+            f"/ws/broadcast?ticket={ticket}",
+        ) as websocket:
+            websocket.send_json(
+                {
+                    "content": "task updated",
+                },
+            )
+
+            with pytest.raises(
+                WebSocketDisconnect,
+            ) as exception_info:
+                websocket.receive_json()
+    finally:
+        client.app.state.realtime_event_publisher = (
+            original_publisher
+        )
+
+    assert (
+        exception_info.value.code
+        == status.WS_1013_TRY_AGAIN_LATER
+    )
+    assert (
+        exception_info.value.reason
+        == "Realtime service unavailable"
+    )

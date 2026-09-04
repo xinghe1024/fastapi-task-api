@@ -3,12 +3,15 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 from redis.asyncio import Redis
+from realtime_broker import RedisRealtimeEventSubscriber
+from realtime_event_handler import RealtimeEventHandler
+from realtime_models import RealtimeMessageEvent
 
 from realtime_broker import (
     REALTIME_EVENTS_CHANNEL,
     RedisRealtimeEventPublisher,
 )
-from realtime_models import RealtimeMessageEvent
+
 
 
 def test_realtime_publisher_serializes_user_event() -> None:
@@ -44,3 +47,70 @@ def test_realtime_publisher_serializes_user_event() -> None:
             "content": "Task updated",
         },
     }
+
+
+def test_realtime_subscriber_dispatches_business_message() -> None:
+    serialized_event = (
+        '{"user_id":7,'
+        '"event":{'
+        '"type":"message",'
+        '"content":"Task updated"'
+        '}}'
+    )
+
+    async def generate_messages():
+        yield {
+            "type": "subscribe",
+            "channel": REALTIME_EVENTS_CHANNEL,
+            "data": 1,
+        }
+        yield {
+            "type": "message",
+            "channel": REALTIME_EVENTS_CHANNEL,
+            "data": serialized_event,
+        }
+
+    pubsub = MagicMock()
+    pubsub.subscribe = AsyncMock()
+    pubsub.listen.return_value = generate_messages()
+    pubsub.__aenter__ = AsyncMock(
+        return_value=pubsub,
+    )
+    pubsub.__aexit__ = AsyncMock(
+        return_value=False,
+    )
+
+    redis_client = MagicMock(spec=Redis)
+    redis_client.pubsub.return_value = pubsub
+
+    event_handler = MagicMock(
+        spec=RealtimeEventHandler,
+    )
+    event_handler.handle = AsyncMock()
+
+    subscriber = RedisRealtimeEventSubscriber(
+        redis_client=redis_client,
+        event_handler=event_handler,
+    )
+
+    async def run_subscriber() -> None:
+        subscriber_task = asyncio.create_task(
+            subscriber.listen(),
+        )
+
+        await subscriber.wait_until_subscribed()
+        await subscriber_task
+
+    asyncio.run(run_subscriber())
+
+    redis_client.pubsub.assert_called_once_with()
+
+    pubsub.subscribe.assert_awaited_once_with(
+        REALTIME_EVENTS_CHANNEL,
+    )
+
+    event_handler.handle.assert_awaited_once_with(
+        serialized_event,
+    )
+
+    pubsub.__aexit__.assert_awaited_once()
