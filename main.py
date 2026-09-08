@@ -1,6 +1,6 @@
 import httpx
 
-from asyncio import TaskGroup
+from asyncio import TaskGroup, wait_for
 from connection_manager import ConnectionManager
 from config import get_settings
 from circuit_breaker import CircuitBreaker
@@ -31,6 +31,7 @@ from realtime_broker import (
     RedisRealtimeEventSubscriber,
 )
 
+REALTIME_SUBSCRIPTION_TIMEOUT_SECONDS = 5.0
 
 @asynccontextmanager
 async def lifespan(
@@ -103,7 +104,10 @@ async def lifespan(
                 name="redis-realtime-subscriber",
             )
 
-            await realtime_subscriber.wait_until_subscribed()
+            await wait_for(
+                realtime_subscriber.wait_until_subscribed(),
+                timeout=REALTIME_SUBSCRIPTION_TIMEOUT_SECONDS,
+            )
 
             try:
                 async with httpx.AsyncClient(
