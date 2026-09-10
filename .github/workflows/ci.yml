@@ -24,6 +24,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    services:
+      redis:
+        image: redis:8.10.0-alpine
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -44,6 +55,14 @@ jobs:
 
       - name: Run tests
         run: uv run --frozen python -m pytest -q
+
+      - name: Run Redis integration tests
+        env:
+          RUN_REDIS_INTEGRATION: "1"
+          TEST_REDIS_URL: "redis://127.0.0.1:6379/0"
+        run: >-
+          uv run --frozen python -m pytest
+          tests/test_realtime_redis_integration.py -vv
 
       - name: Apply migrations
         run: uv run --frozen alembic upgrade head

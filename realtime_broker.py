@@ -87,10 +87,15 @@ class RedisRealtimeEventSubscriber:
 
         self._subscribed_event = asyncio.Event()
         self._has_subscribed_once = False
+        self._subscription_generation = 0
 
     @property
     def is_subscribed(self) -> bool:
         return self._subscribed_event.is_set()
+
+    @property
+    def subscription_generation(self) -> int:
+        return self._subscription_generation
 
     async def listen(self) -> None:
         while True:
@@ -132,6 +137,7 @@ class RedisRealtimeEventSubscriber:
                     # 收到目标频道的订阅确认后，才标记就绪
                     self._backoff.reset()
                     self._has_subscribed_once = True
+                    self._subscription_generation += 1
                     self._subscribed_event.set()
                     continue
 
