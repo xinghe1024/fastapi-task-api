@@ -62,7 +62,10 @@ jobs:
           TEST_REDIS_URL: "redis://127.0.0.1:6379/0"
         run: >-
           uv run --frozen python -m pytest
-          tests/test_realtime_redis_integration.py -vv
+          tests/test_realtime_redis_integration.py
+          tests/test_redis_streams_integration.py
+          tests/test_message_idempotency.py
+          -vv
 
       - name: Apply migrations
         run: uv run --frozen alembic upgrade head
