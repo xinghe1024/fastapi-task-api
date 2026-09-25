@@ -2,17 +2,41 @@ import pytest
 import os
 import json
 
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from sqlalchemy import URL, Engine, create_engine, text
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from unittest.mock import Mock
 
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis import Redis as SyncRedis
 
 
 class EventPayloadConflictError(ValueError):
     """同一业务事件编号对应了不同的业务内容。"""
+
+
+
+WRITE_DEAD_LETTER_ONCE_SCRIPT = """
+local existing_id = redis.call("HGET", KEYS[2], ARGV[1])
+if existing_id then
+    return existing_id
+end
+
+local dead_letter_id = redis.call(
+    "XADD", KEYS[1], "*",
+    "source_stream", ARGV[2],
+    "source_group", ARGV[3],
+    "source_message_id", ARGV[4],
+    "payload", ARGV[5],
+    "reason", ARGV[6]
+)
+
+redis.call("HSET", KEYS[2], ARGV[1], dead_letter_id)
+return dead_letter_id
+"""
 
 
 def apply_completion_once(
@@ -136,6 +160,68 @@ def write_dead_letter(
             "reason": reason,
         },
     )
+
+
+def write_dead_letter_once(
+    redis_client: SyncRedis,
+    dead_letter_stream: str,
+    source_stream: str,
+    source_group: str,
+    source_message_id: str,
+    payload: dict[str, str],
+    reason: str,
+) -> str:
+    deduplication_key = f"{dead_letter_stream}:dedup"
+
+    # 用 JSON 数组保留三个身份组成部分的明确边界
+    message_identity = json.dumps(
+        [source_stream, source_group, source_message_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    return redis_client.eval(
+        WRITE_DEAD_LETTER_ONCE_SCRIPT,
+        2,
+        dead_letter_stream,
+        deduplication_key,
+        message_identity,
+        source_stream,
+        source_group,
+        source_message_id,
+        json.dumps(payload, ensure_ascii=False),
+        reason,
+    )
+
+
+def archive_message_and_acknowledge(
+    redis_client: SyncRedis,
+    dead_letter_stream: str,
+    source_stream: str,
+    source_group: str,
+    source_message_id: str,
+    payload: dict[str, str],
+    reason: str,
+) -> tuple[str, int]:
+    # 先保存排查依据；失败时异常会直接向上传递
+    dead_letter_id = write_dead_letter_once(
+        redis_client,
+        dead_letter_stream=dead_letter_stream,
+        source_stream=source_stream,
+        source_group=source_group,
+        source_message_id=source_message_id,
+        payload=payload,
+        reason=reason,
+    )
+
+    # 只有保存成功，才会执行到这里
+    acknowledged_count = redis_client.xack(
+        source_stream,
+        source_group,
+        source_message_id,
+    )
+
+    return dead_letter_id, acknowledged_count
 
 
 def test_duplicate_message_increments_counter_only_once() -> None:
@@ -936,3 +1022,803 @@ def test_dead_letter_preserves_message_without_acknowledging() -> None:
         finally:
             # 只删除本次测试创建的两个随机 Stream
             redis_client.delete(source_stream, dead_letter_stream)
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+@pytest.mark.parametrize(
+    "write_fails",
+    [False, True],
+    ids=["saved", "write-failed"],
+)
+def test_archive_acknowledges_only_after_saving(
+    monkeypatch: pytest.MonkeyPatch,
+    write_fails: bool,
+) -> None:
+    test_prefix = f"test:archive:{uuid4().hex}"
+    source_stream = f"{test_prefix}:source"
+    dead_letter_stream = f"{test_prefix}:failed"
+    group_name = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "10",
+    }
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    ) as redis_client:
+        redis_client.ping()
+
+        try:
+            source_id = redis_client.xadd(source_stream, payload)
+            redis_client.xgroup_create(
+                source_stream, group_name, id="0-0",
+            )
+            received = redis_client.xreadgroup(
+                groupname=group_name,
+                consumername="worker-a",
+                streams={source_stream: ">"},
+                count=1,
+            )
+            assert received == [
+                [source_stream, [(source_id, payload)]],
+            ]
+            received_id, received_payload = received[0][1][0]
+
+            with monkeypatch.context() as patch:
+                if write_fails:
+                    # 原消息已经准备好，只模拟后续死信写入失败
+                    patch.setattr(
+                        redis_client,
+                        "eval",
+                        Mock(
+                            side_effect=RedisConnectionError(
+                                "Dead-letter write failed"
+                            ),
+                        ),
+                    )
+
+                expected_outcome = (
+                    pytest.raises(
+                        RedisConnectionError,
+                        match="^Dead-letter write failed$",
+                    )
+                    if write_fails
+                    else nullcontext()
+                )
+
+                result = None
+                with expected_outcome:
+                    result = archive_message_and_acknowledge(
+                        redis_client,
+                        dead_letter_stream=dead_letter_stream,
+                        source_stream=source_stream,
+                        source_group=group_name,
+                        source_message_id=received_id,
+                        payload=received_payload,
+                        reason="event_payload_conflict",
+                    )
+
+            # 此处临时替换已经恢复，查询真实 Redis 状态
+            records = redis_client.xrange(dead_letter_stream)
+            pending = redis_client.xpending(
+                source_stream, group_name,
+            )
+
+            if write_fails:
+                assert result is None
+                assert records == []
+                assert pending["pending"] == 1
+            else:
+                assert result is not None
+                dead_letter_id, acknowledged_count = result
+
+                assert acknowledged_count == 1
+                assert pending["pending"] == 0
+                assert len(records) == 1
+                assert records[0][0] == dead_letter_id
+                assert records[0][1]["source_message_id"] == source_id
+                assert json.loads(records[0][1]["payload"]) == payload
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                f"{dead_letter_stream}:dedup",
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_dead_letter_retry_reuses_existing_record() -> None:
+    test_prefix = f"test:dead-letter-once:{uuid4().hex}"
+    source_stream = f"{test_prefix}:source"
+    dead_letter_stream = f"{test_prefix}:failed"
+    deduplication_key = f"{dead_letter_stream}:dedup"
+    group_name = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "10",
+    }
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    ) as redis_client:
+        redis_client.ping()
+
+        try:
+            source_id = redis_client.xadd(source_stream, payload)
+
+            first_id = write_dead_letter_once(
+                redis_client,
+                dead_letter_stream,
+                source_stream,
+                group_name,
+                source_id,
+                payload,
+                "event_payload_conflict",
+            )
+            second_id = write_dead_letter_once(
+                redis_client,
+                dead_letter_stream,
+                source_stream,
+                group_name,
+                source_id,
+                payload,
+                "event_payload_conflict",
+            )
+
+            # 重复调用应复用同一个死信编号
+            assert second_id == first_id
+
+            # 不能只检查编号，还要检查真正保存的记录
+            records = redis_client.xrange(dead_letter_stream)
+            assert len(records) == 1
+
+            stored_id, stored_record = records[0]
+            assert stored_id == first_id
+            assert stored_record["source_stream"] == source_stream
+            assert stored_record["source_group"] == group_name
+            assert stored_record["source_message_id"] == source_id
+            assert stored_record["reason"] == "event_payload_conflict"
+            assert json.loads(stored_record["payload"]) == payload
+
+            # 索引中也只应登记这一条死信编号
+            indexed_ids = redis_client.hvals(deduplication_key)
+            assert indexed_ids == [first_id]
+        finally:
+            # 本轮多创建了索引，清理时不能遗漏
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                deduplication_key,
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_retry_after_save_before_ack_uses_one_dead_letter() -> None:
+    test_prefix = f"test:archive-retry:{uuid4().hex}"
+    source_stream = f"{test_prefix}:source"
+    dead_letter_stream = f"{test_prefix}:failed"
+    deduplication_key = f"{dead_letter_stream}:dedup"
+    group_name = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "10",
+    }
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    ) as redis_client:
+        redis_client.ping()
+
+        try:
+            source_id = redis_client.xadd(source_stream, payload)
+            redis_client.xgroup_create(
+                source_stream,
+                group_name,
+                id="0-0",
+            )
+            received = redis_client.xreadgroup(
+                groupname=group_name,
+                consumername="worker-a",
+                streams={source_stream: ">"},
+                count=1,
+            )
+            assert received == [
+                [source_stream, [(source_id, payload)]],
+            ]
+            received_id, received_payload = received[0][1][0]
+
+            # 模拟死信已保存，但原消息尚未确认时进程中断
+            saved_id = write_dead_letter_once(
+                redis_client,
+                dead_letter_stream,
+                source_stream,
+                group_name,
+                received_id,
+                received_payload,
+                "event_payload_conflict",
+            )
+            assert redis_client.xpending(
+                source_stream, group_name,
+            )["pending"] == 1
+
+            # 测试中立即允许另一个 worker 接管
+            claimed = redis_client.xautoclaim(
+                source_stream,
+                group_name,
+                "worker-b",
+                min_idle_time=0,
+                start_id="0-0",
+                count=1,
+            )
+            claimed_messages = claimed[1]
+            assert claimed_messages == [(source_id, payload)]
+            claimed_id, claimed_payload = claimed_messages[0]
+
+            retry_id, acknowledged_count = (
+                archive_message_and_acknowledge(
+                    redis_client,
+                    dead_letter_stream=dead_letter_stream,
+                    source_stream=source_stream,
+                    source_group=group_name,
+                    source_message_id=claimed_id,
+                    payload=claimed_payload,
+                    reason="event_payload_conflict",
+                )
+            )
+
+            assert retry_id == saved_id
+            assert acknowledged_count == 1
+            assert redis_client.xpending(
+                source_stream, group_name,
+            )["pending"] == 0
+
+            dead_letters = redis_client.xrange(
+                dead_letter_stream,
+            )
+            assert len(dead_letters) == 1
+            assert dead_letters[0][0] == saved_id
+            assert dead_letters[0][1]["source_message_id"] == source_id
+            assert json.loads(
+                dead_letters[0][1]["payload"]
+            ) == payload
+            assert redis_client.hvals(
+                deduplication_key
+            ) == [saved_id]
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                deduplication_key,
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_lost_reply_after_saving_dead_letter_is_safe_to_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_prefix = f"test:lost-reply:{uuid4().hex}"
+    source_stream = f"{test_prefix}:source"
+    dead_letter_stream = f"{test_prefix}:failed"
+    deduplication_key = f"{dead_letter_stream}:dedup"
+    group_name = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "10",
+    }
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    ) as redis_client:
+        redis_client.ping()
+
+        try:
+            source_id = redis_client.xadd(source_stream, payload)
+            redis_client.xgroup_create(
+                source_stream,
+                group_name,
+                id="0-0",
+            )
+            messages = redis_client.xreadgroup(
+                groupname=group_name,
+                consumername="worker-a",
+                streams={source_stream: ">"},
+                count=1,
+            )
+            assert messages == [
+                [source_stream, [(source_id, payload)]],
+            ]
+            message_id, received_payload = messages[0][1][0]
+
+            # 保留真实方法，让 Redis 先执行保存脚本
+            real_eval = redis_client.eval
+
+            def execute_then_lose_reply(
+                *args: object,
+                **kwargs: object,
+            ) -> None:
+                real_eval(*args, **kwargs)
+                raise RedisConnectionError(
+                    "Reply lost after write"
+                )
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    redis_client,
+                    "eval",
+                    execute_then_lose_reply,
+                )
+                with pytest.raises(
+                    RedisConnectionError,
+                    match="^Reply lost after write$",
+                ):
+                    archive_message_and_acknowledge(
+                        redis_client,
+                        dead_letter_stream=dead_letter_stream,
+                        source_stream=source_stream,
+                        source_group=group_name,
+                        source_message_id=message_id,
+                        payload=received_payload,
+                        reason="event_payload_conflict",
+                    )
+
+            # 临时替换已恢复，查询 Redis 中的真实状态
+            dead_letters = redis_client.xrange(
+                dead_letter_stream
+            )
+            assert len(dead_letters) == 1
+
+            saved_id = dead_letters[0][0]
+            assert (
+                dead_letters[0][1]["source_message_id"]
+                == source_id
+            )
+            assert json.loads(
+                dead_letters[0][1]["payload"]
+            ) == payload
+            assert redis_client.hvals(
+                deduplication_key
+            ) == [saved_id]
+            assert redis_client.xpending(
+                source_stream, group_name,
+            )["pending"] == 1
+
+            # 再次处理同一条原消息
+            retry_id, acknowledged_count = (
+                archive_message_and_acknowledge(
+                    redis_client,
+                    dead_letter_stream=dead_letter_stream,
+                    source_stream=source_stream,
+                    source_group=group_name,
+                    source_message_id=message_id,
+                    payload=received_payload,
+                    reason="event_payload_conflict",
+                )
+            )
+
+            assert retry_id == saved_id
+            assert acknowledged_count == 1
+            assert len(
+                redis_client.xrange(dead_letter_stream)
+            ) == 1
+            assert redis_client.xpending(
+                source_stream, group_name,
+            )["pending"] == 0
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                deduplication_key,
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_lost_xack_reply_does_not_duplicate_dead_letter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_prefix = f"test:lost-xack-reply:{uuid4().hex}"
+    source_stream = f"{test_prefix}:source"
+    dead_letter_stream = f"{test_prefix}:failed"
+    deduplication_key = f"{dead_letter_stream}:dedup"
+    group_name = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "10",
+    }
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    ) as redis_client:
+        redis_client.ping()
+
+        try:
+            source_id = redis_client.xadd(source_stream, payload)
+            redis_client.xgroup_create(
+                source_stream,
+                group_name,
+                id="0-0",
+            )
+            messages = redis_client.xreadgroup(
+                groupname=group_name,
+                consumername="worker-a",
+                streams={source_stream: ">"},
+                count=1,
+            )
+            assert messages == [
+                [source_stream, [(source_id, payload)]],
+            ]
+            message_id, received_payload = messages[0][1][0]
+
+            real_xack = redis_client.xack
+
+            def acknowledge_then_lose_reply(
+                stream_name: str,
+                consumer_group: str,
+                pending_id: str,
+            ) -> None:
+                real_xack(
+                    stream_name,
+                    consumer_group,
+                    pending_id,
+                )
+                raise RedisConnectionError(
+                    "XACK reply lost"
+                )
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    redis_client,
+                    "xack",
+                    acknowledge_then_lose_reply,
+                )
+                with pytest.raises(
+                    RedisConnectionError,
+                    match="^XACK reply lost$",
+                ):
+                    archive_message_and_acknowledge(
+                        redis_client,
+                        dead_letter_stream=dead_letter_stream,
+                        source_stream=source_stream,
+                        source_group=group_name,
+                        source_message_id=message_id,
+                        payload=received_payload,
+                        reason="event_payload_conflict",
+                    )
+
+            # 替身已恢复，查询 Redis 中的真实状态
+            dead_letters = redis_client.xrange(
+                dead_letter_stream
+            )
+            assert len(dead_letters) == 1
+
+            saved_id = dead_letters[0][0]
+            assert redis_client.hvals(
+                deduplication_key
+            ) == [saved_id]
+            assert redis_client.xpending(
+                source_stream,
+                group_name,
+            )["pending"] == 0
+
+            # XACK 移除 pending，不删除原 Stream 正文
+            assert redis_client.xrange(source_stream) == [
+                (source_id, payload),
+            ]
+
+            # 手动再次调用，用来观察重复调用的结果
+            retry_id, acknowledged_count = (
+                archive_message_and_acknowledge(
+                    redis_client,
+                    dead_letter_stream=dead_letter_stream,
+                    source_stream=source_stream,
+                    source_group=group_name,
+                    source_message_id=message_id,
+                    payload=received_payload,
+                    reason="event_payload_conflict",
+                )
+            )
+
+            assert retry_id == saved_id
+            assert acknowledged_count == 0
+            assert len(
+                redis_client.xrange(dead_letter_stream)
+            ) == 1
+            assert redis_client.xpending(
+                source_stream,
+                group_name,
+            )["pending"] == 0
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                deduplication_key,
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_pending_is_claimed_only_after_idle_threshold() -> None:
+    source_stream = f"test:claim-idle:{uuid4().hex}"
+    group_name = "completion-workers"
+    payload = {"event_id": "event-a"}
+    claim_threshold_ms = 60_000
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0,
+    ) as redis_client:
+        redis_client.ping()
+
+        try:
+            message_id = redis_client.xadd(
+                source_stream, payload,
+            )
+            redis_client.xgroup_create(
+                source_stream,
+                group_name,
+                id="0-0",
+            )
+            received = redis_client.xreadgroup(
+                groupname=group_name,
+                consumername="worker-a",
+                streams={source_stream: ">"},
+                count=1,
+            )
+            assert received == [
+                [source_stream, [(message_id, payload)]],
+            ]
+
+            # 消息刚领取，不满足一分钟的接管门槛
+            early_claim = redis_client.xautoclaim(
+                source_stream,
+                group_name,
+                "worker-b",
+                min_idle_time=claim_threshold_ms,
+                start_id="0-0",
+                count=1,
+            )
+            assert early_claim[1] == []
+
+            pending_before = redis_client.xpending_range(
+                source_stream,
+                group_name,
+                "-",
+                "+",
+                1,
+            )[0]
+            assert pending_before["consumer"] == "worker-a"
+
+            # 仅测试用：人为模拟已空闲 61 秒
+            aged_message = redis_client.xclaim(
+                source_stream,
+                group_name,
+                "worker-a",
+                min_idle_time=0,
+                message_ids=[message_id],
+                idle=61_000,
+            )
+            assert aged_message == [(message_id, payload)]
+
+            # 现在超过门槛，worker-b 可以接管
+            claimed = redis_client.xautoclaim(
+                source_stream,
+                group_name,
+                "worker-b",
+                min_idle_time=claim_threshold_ms,
+                start_id="0-0",
+                count=1,
+            )
+            assert claimed[1] == [(message_id, payload)]
+
+            pending_after = redis_client.xpending_range(
+                source_stream,
+                group_name,
+                "-",
+                "+",
+                1,
+            )[0]
+            assert pending_after["consumer"] == "worker-b"
+
+            assert redis_client.xack(
+                source_stream,
+                group_name,
+                message_id,
+            ) == 1
+            assert redis_client.xpending(
+                source_stream,
+                group_name,
+            )["pending"] == 0
+        finally:
+            redis_client.delete(source_stream)
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+@pytest.mark.parametrize(
+    "first_finisher",
+    ["worker-a", "worker-b"],
+)
+def test_reclaimed_message_has_one_business_effect(
+    first_finisher: str,
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    source_stream = f"test:claim-overlap:{uuid4().hex}"
+    group_name = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "3",
+    }
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+
+    try:
+        initialize_counter_database(engine)
+
+        with SyncRedis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+        ) as redis_client:
+            redis_client.ping()
+
+            try:
+                source_id = redis_client.xadd(
+                    source_stream, payload,
+                )
+                redis_client.xgroup_create(
+                    source_stream, group_name, id="0-0",
+                )
+                received_a = redis_client.xreadgroup(
+                    groupname=group_name,
+                    consumername="worker-a",
+                    streams={source_stream: ">"},
+                    count=1,
+                )
+                assert received_a == [
+                    [source_stream, [(source_id, payload)]],
+                ]
+
+                # 模拟 A 仍持有消息，但空闲时间已超过门槛
+                redis_client.xclaim(
+                    source_stream,
+                    group_name,
+                    "worker-a",
+                    min_idle_time=0,
+                    message_ids=[source_id],
+                    idle=61_000,
+                )
+                claimed_b = redis_client.xautoclaim(
+                    source_stream,
+                    group_name,
+                    "worker-b",
+                    min_idle_time=60_000,
+                    start_id="0-0",
+                    count=1,
+                )
+                assert claimed_b[1] == [(source_id, payload)]
+
+                pending_entry = redis_client.xpending_range(
+                    source_stream, group_name, "-", "+", 1,
+                )[0]
+                assert pending_entry["consumer"] == "worker-b"
+
+                # 两边分别保留自己实际取得的消息
+                deliveries = {
+                    "worker-a": received_a[0][1][0],
+                    "worker-b": claimed_b[1][0],
+                }
+                second_finisher = (
+                    "worker-b"
+                    if first_finisher == "worker-a"
+                    else "worker-a"
+                )
+
+                results = []
+                for worker_name in (
+                    first_finisher,
+                    second_finisher,
+                ):
+                    message_id, message_payload = (
+                        deliveries[worker_name]
+                    )
+                    result = process_completion_and_acknowledge(
+                        engine,
+                        redis_client,
+                        source_stream,
+                        group_name,
+                        message_id=message_id,
+                        event_id=message_payload["event_id"],
+                        increment_by=int(
+                            message_payload["increment_by"]
+                        ),
+                    )
+                    results.append(result)
+
+                # 先完成的执行业务，后完成的识别为正常重复
+                assert results == [(True, 1), (False, 0)]
+
+                with engine.connect() as connection:
+                    completed_count = connection.execute(
+                        text(
+                            "SELECT completed_count "
+                            "FROM completion_counter WHERE id = 1"
+                        ),
+                    ).scalar_one()
+                    stored_events = connection.execute(
+                        text(
+                            "SELECT event_id, increment_by "
+                            "FROM processed_events"
+                        ),
+                    ).all()
+
+                assert completed_count == 3
+                assert stored_events == [("event-a", 3)]
+                assert redis_client.xpending(
+                    source_stream, group_name,
+                )["pending"] == 0
+            finally:
+                redis_client.delete(source_stream)
+    finally:
+        engine.dispose()
