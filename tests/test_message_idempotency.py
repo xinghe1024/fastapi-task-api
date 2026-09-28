@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 from sqlalchemy import URL, Engine, create_engine, text
 from pathlib import Path
+from typing import Literal
 from threading import Barrier
 from unittest.mock import Mock
 
@@ -17,6 +18,45 @@ from redis import Redis as SyncRedis
 class EventPayloadConflictError(ValueError):
     """同一业务事件编号对应了不同的业务内容。"""
 
+
+class RetryableMessageError(RuntimeError):
+    """明确允许有限重试的消息处理故障。"""
+
+
+def should_retry_message(
+    failed_attempts: int,
+    max_attempts: int = 3,
+) -> bool:
+    """判断可重试故障发生后，是否还有剩余尝试次数。"""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    if failed_attempts < 1:
+        raise ValueError("failed_attempts must be at least 1")
+
+    return failed_attempts < max_attempts
+
+
+def decide_message_failure(
+    error: Exception,
+    failed_attempts: int,
+    max_attempts: int = 3,
+) -> Literal["retry", "dead_letter"]:
+    """根据故障类型和失败次数，决定后续处理方向。"""
+    if isinstance(error, EventPayloadConflictError):
+        return "dead_letter"
+
+    if isinstance(error, RetryableMessageError):
+        if should_retry_message(
+            failed_attempts=failed_attempts,
+            max_attempts=max_attempts,
+        ):
+            return "retry"
+
+        return "dead_letter"
+
+    # 未知错误继续向上抛出，不擅自重试或隔离消息。
+    raise error
 
 
 WRITE_DEAD_LETTER_ONCE_SCRIPT = """
@@ -222,6 +262,85 @@ def archive_message_and_acknowledge(
     )
 
     return dead_letter_id, acknowledged_count
+
+
+def handle_message_failure(
+    redis_client: SyncRedis,
+    dead_letter_stream: str,
+    source_stream: str,
+    source_group: str,
+    source_message_id: str,
+    payload: dict[str, str],
+    error: Exception,
+    failed_attempts: int,
+    max_attempts: int = 3,
+) -> Literal["retry", "dead_letter"]:
+    """执行失败处理决定，不负责计数或重新执行业务。"""
+    action = decide_message_failure(
+        error=error,
+        failed_attempts=failed_attempts,
+        max_attempts=max_attempts,
+    )
+
+    if action == "retry":
+        # 不确认消息，让它继续保留在待确认列表中。
+        return "retry"
+
+    archive_message_and_acknowledge(
+        redis_client=redis_client,
+        dead_letter_stream=dead_letter_stream,
+        source_stream=source_stream,
+        source_group=source_group,
+        source_message_id=source_message_id,
+        payload=payload,
+        reason=type(error).__name__,
+    )
+
+    return "dead_letter"
+
+
+def process_completion_with_failure_policy(
+    engine: Engine,
+    redis_client: SyncRedis,
+    dead_letter_stream: str,
+    source_stream: str,
+    source_group: str,
+    source_message_id: str,
+    payload: dict[str, str],
+    failed_attempts: int,
+    max_attempts: int = 3,
+) -> Literal["applied", "duplicate", "retry", "dead_letter"]:
+    """执行业务，并将已识别的业务故障交给失败处理入口。"""
+    event_id = payload["event_id"]
+    increment_by = int(payload["increment_by"])
+
+    try:
+        applied = apply_completion_once(
+            engine,
+            event_id,
+            increment_by=increment_by,
+        )
+    except (EventPayloadConflictError, RetryableMessageError) as error:
+        return handle_message_failure(
+            redis_client=redis_client,
+            dead_letter_stream=dead_letter_stream,
+            source_stream=source_stream,
+            source_group=source_group,
+            source_message_id=source_message_id,
+            payload=payload,
+            error=error,
+            failed_attempts=failed_attempts,
+            max_attempts=max_attempts,
+        )
+
+    # 确认失败属于确认阶段故障，不送入业务失败分类。
+    redis_client.xack(
+        source_stream,
+        source_group,
+        source_message_id,
+    )
+
+    return "applied" if applied else "duplicate"
 
 
 def test_duplicate_message_increments_counter_only_once() -> None:
@@ -1820,5 +1939,582 @@ def test_reclaimed_message_has_one_business_effect(
                 )["pending"] == 0
             finally:
                 redis_client.delete(source_stream)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("failed_attempts", "expected_retry"),
+    [
+        (1, True),
+        (2, True),
+        (3, False),
+        (4, False),
+    ],
+)
+def test_message_retry_respects_attempt_limit(
+    failed_attempts: int,
+    expected_retry: bool,
+) -> None:
+    should_retry = should_retry_message(
+        failed_attempts=failed_attempts,
+        max_attempts=3,
+    )
+
+    assert should_retry is expected_retry
+
+
+@pytest.mark.parametrize(
+    ("failed_attempts", "max_attempts", "expected_parameter"),
+    [
+        (0, 3, "failed_attempts"),
+        (-1, 3, "failed_attempts"),
+        (1, 0, "max_attempts"),
+        (1, -1, "max_attempts"),
+    ],
+)
+def test_message_retry_rejects_invalid_counts(
+    failed_attempts: int,
+    max_attempts: int,
+    expected_parameter: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=expected_parameter,
+    ):
+        should_retry_message(
+            failed_attempts=failed_attempts,
+            max_attempts=max_attempts,
+        )
+
+
+@pytest.mark.parametrize(
+    ("error", "failed_attempts", "expected_action"),
+    [
+        (
+            RetryableMessageError("Temporary failure"),
+            1,
+            "retry",
+        ),
+        (
+            RetryableMessageError("Temporary failure"),
+            3,
+            "dead_letter",
+        ),
+        (
+            EventPayloadConflictError("Payload conflict"),
+            1,
+            "dead_letter",
+        ),
+    ],
+)
+def test_message_failure_selects_action(
+    error: Exception,
+    failed_attempts: int,
+    expected_action: str,
+) -> None:
+    action = decide_message_failure(
+        error=error,
+        failed_attempts=failed_attempts,
+        max_attempts=3,
+    )
+
+    assert action == expected_action
+
+
+def test_message_failure_propagates_unknown_error() -> None:
+    original_error = TypeError("Unexpected programming error")
+
+    with pytest.raises(TypeError) as captured_error:
+        decide_message_failure(
+            error=original_error,
+            failed_attempts=1,
+            max_attempts=3,
+        )
+
+    assert captured_error.value is original_error
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+@pytest.mark.parametrize(
+    (
+        "error",
+        "failed_attempts",
+        "expected_action",
+        "expected_reason",
+    ),
+    [
+        (
+            RetryableMessageError("Temporary failure"),
+            1,
+            "retry",
+            None,
+        ),
+        (
+            RetryableMessageError("Temporary failure"),
+            3,
+            "dead_letter",
+            "RetryableMessageError",
+        ),
+        (
+            EventPayloadConflictError("Payload conflict"),
+            1,
+            "dead_letter",
+            "EventPayloadConflictError",
+        ),
+    ],
+)
+def test_failure_handler_applies_retry_policy(
+    error: Exception,
+    failed_attempts: int,
+    expected_action: str,
+    expected_reason: str | None,
+) -> None:
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+    key_prefix = f"test:message-retry:{uuid4().hex}"
+    source_stream = f"{key_prefix}:source"
+    dead_letter_stream = f"{key_prefix}:dead"
+    source_group = "retry-test-group"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "3",
+    }
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    ) as redis_client:
+        try:
+            message_id = redis_client.xadd(
+                source_stream,
+                payload,
+            )
+            redis_client.xgroup_create(
+                source_stream,
+                source_group,
+                id="0-0",
+            )
+
+            # 先领取消息，使其进入待确认列表。
+            received = redis_client.xreadgroup(
+                source_group,
+                "worker-a",
+                {source_stream: ">"},
+                count=1,
+            )
+            assert received[0][1][0][0] == message_id
+
+            action = handle_message_failure(
+                redis_client=redis_client,
+                dead_letter_stream=dead_letter_stream,
+                source_stream=source_stream,
+                source_group=source_group,
+                source_message_id=message_id,
+                payload=payload,
+                error=error,
+                failed_attempts=failed_attempts,
+                max_attempts=3,
+            )
+
+            assert action == expected_action
+
+            pending_messages = redis_client.xpending_range(
+                source_stream,
+                source_group,
+                "-",
+                "+",
+                10,
+            )
+
+            if expected_action == "retry":
+                assert [
+                           message["message_id"]
+                           for message in pending_messages
+                       ] == [message_id]
+
+                assert redis_client.xlen(dead_letter_stream) == 0
+                assert redis_client.exists(
+                    f"{dead_letter_stream}:dedup",
+                ) == 0
+            else:
+                assert pending_messages == []
+
+                dead_letters = redis_client.xrange(
+                    dead_letter_stream,
+                )
+                assert len(dead_letters) == 1
+                dead_letter_id, dead_letter = dead_letters[0]
+
+                assert dead_letter["source_stream"] == source_stream
+                assert dead_letter["source_group"] == source_group
+                assert dead_letter["source_message_id"] == message_id
+                assert json.loads(dead_letter["payload"]) == payload
+                assert dead_letter["reason"] == expected_reason
+
+                message_identity = json.dumps(
+                    [source_stream, source_group, message_id],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                assert redis_client.hgetall(
+                    f"{dead_letter_stream}:dedup",
+                ) == {message_identity: dead_letter_id}
+
+                # 确认只移除了 pending，原消息正文仍然存在。
+                assert redis_client.xrange(source_stream) == [
+                    (message_id, payload),
+                ]
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                f"{dead_letter_stream}:dedup",
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_failure_handler_preserves_pending_when_archive_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+    key_prefix = f"test:archive-failure:{uuid4().hex}"
+    source_stream = f"{key_prefix}:source"
+    dead_letter_stream = f"{key_prefix}:dead"
+    source_group = "archive-failure-group"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "3",
+    }
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    ) as redis_client:
+        try:
+            message_id = redis_client.xadd(
+                source_stream,
+                payload,
+            )
+            redis_client.xgroup_create(
+                source_stream,
+                source_group,
+                id="0-0",
+            )
+            received = redis_client.xreadgroup(
+                source_group,
+                "worker-a",
+                {source_stream: ">"},
+                count=1,
+            )
+            assert received[0][1][0][0] == message_id
+
+            # 只让死信保存脚本失败，其他 Redis 操作保持真实。
+            save_error = RedisConnectionError(
+                "Dead-letter write failed",
+            )
+            failed_eval = Mock(side_effect=save_error)
+            acknowledge_spy = Mock(wraps=redis_client.xack)
+
+            monkeypatch.setattr(
+                redis_client,
+                "eval",
+                failed_eval,
+            )
+            monkeypatch.setattr(
+                redis_client,
+                "xack",
+                acknowledge_spy,
+            )
+
+            with pytest.raises(
+                RedisConnectionError,
+                match="Dead-letter write failed",
+            ) as captured_error:
+                handle_message_failure(
+                    redis_client=redis_client,
+                    dead_letter_stream=dead_letter_stream,
+                    source_stream=source_stream,
+                    source_group=source_group,
+                    source_message_id=message_id,
+                    payload=payload,
+                    error=RetryableMessageError("Temporary failure"),
+                    failed_attempts=3,
+                    max_attempts=3,
+                )
+
+            # 保存确实被尝试，异常没有被吞掉，确认没有被调用。
+            assert captured_error.value is save_error
+            failed_eval.assert_called_once()
+            acknowledge_spy.assert_not_called()
+
+            pending_messages = redis_client.xpending_range(
+                source_stream,
+                source_group,
+                "-",
+                "+",
+                10,
+            )
+            assert [
+                message["message_id"]
+                for message in pending_messages
+            ] == [message_id]
+
+            assert redis_client.xlen(dead_letter_stream) == 0
+            assert redis_client.exists(
+                f"{dead_letter_stream}:dedup",
+            ) == 0
+            assert redis_client.xrange(source_stream) == [
+                (message_id, payload),
+            ]
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                f"{dead_letter_stream}:dedup",
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_failure_handler_preserves_pending_for_unknown_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+    key_prefix = f"test:unknown-failure:{uuid4().hex}"
+    source_stream = f"{key_prefix}:source"
+    dead_letter_stream = f"{key_prefix}:dead"
+    source_group = "archive-failure-group"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "3",
+    }
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    ) as redis_client:
+        try:
+            message_id = redis_client.xadd(
+                source_stream,
+                payload,
+            )
+            redis_client.xgroup_create(
+                source_stream,
+                source_group,
+                id="0-0",
+            )
+            received = redis_client.xreadgroup(
+                source_group,
+                "worker-a",
+                {source_stream: ">"},
+                count=1,
+            )
+            assert received[0][1][0][0] == message_id
+
+            original_error = TypeError(
+                "Unexpected programming error",
+            )
+            save_spy = Mock(wraps=redis_client.eval)
+            acknowledge_spy = Mock(wraps=redis_client.xack)
+
+            monkeypatch.setattr(
+                redis_client,
+                "eval",
+                save_spy,
+            )
+            monkeypatch.setattr(
+                redis_client,
+                "xack",
+                acknowledge_spy,
+            )
+
+            with pytest.raises(
+                    TypeError,
+                    match="Unexpected programming error",
+            ) as captured_error:
+                handle_message_failure(
+                    redis_client=redis_client,
+                    dead_letter_stream=dead_letter_stream,
+                    source_stream=source_stream,
+                    source_group=source_group,
+                    source_message_id=message_id,
+                    payload=payload,
+                    error=original_error,
+                    failed_attempts=3,
+                    max_attempts=3,
+                )
+
+            assert captured_error.value is original_error
+            save_spy.assert_not_called()
+            acknowledge_spy.assert_not_called()
+
+            pending_messages = redis_client.xpending_range(
+                source_stream,
+                source_group,
+                "-",
+                "+",
+                10,
+            )
+            assert [
+                message["message_id"]
+                for message in pending_messages
+            ] == [message_id]
+
+            assert redis_client.xlen(dead_letter_stream) == 0
+            assert redis_client.exists(
+                f"{dead_letter_stream}:dedup",
+            ) == 0
+            assert redis_client.xrange(source_stream) == [
+                (message_id, payload),
+            ]
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                f"{dead_letter_stream}:dedup",
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要明确开启真实 Redis 集成测试",
+)
+def test_real_conflict_is_archived_without_changing_database() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+    key_prefix = f"test:real-conflict:{uuid4().hex}"
+    source_stream = f"{key_prefix}:source"
+    dead_letter_stream = f"{key_prefix}:dead"
+    source_group = "conflict-workers"
+    conflicting_payload = {
+        "event_id": "event-a",
+        "increment_by": "10",
+    }
+
+    try:
+        initialize_counter_database(engine)
+
+        # 先真实提交原事件：增加 3。
+        assert apply_completion_once(
+            engine,
+            "event-a",
+            increment_by=3,
+        ) is True
+
+        with SyncRedis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+        ) as redis_client:
+            try:
+                message_id = redis_client.xadd(
+                    source_stream,
+                    conflicting_payload,
+                )
+                redis_client.xgroup_create(
+                    source_stream,
+                    source_group,
+                    id="0-0",
+                )
+                received = redis_client.xreadgroup(
+                    source_group,
+                    "worker-a",
+                    {source_stream: ">"},
+                    count=1,
+                )
+                received_id, received_payload = received[0][1][0]
+                assert received_id == message_id
+
+                # 传入实际领取的内容，由数据库业务逻辑发现冲突。
+                action = process_completion_with_failure_policy(
+                    engine=engine,
+                    redis_client=redis_client,
+                    dead_letter_stream=dead_letter_stream,
+                    source_stream=source_stream,
+                    source_group=source_group,
+                    source_message_id=received_id,
+                    payload=received_payload,
+                    failed_attempts=1,
+                    max_attempts=3,
+                )
+                assert action == "dead_letter"
+
+                with engine.connect() as connection:
+                    completed_count = connection.execute(
+                        text(
+                            "SELECT completed_count "
+                            "FROM completion_counter WHERE id = 1"
+                        ),
+                    ).scalar_one()
+                    stored_events = connection.execute(
+                        text(
+                            "SELECT event_id, increment_by "
+                            "FROM processed_events"
+                        ),
+                    ).all()
+
+                assert completed_count == 3
+                assert stored_events == [("event-a", 3)]
+
+                dead_letters = redis_client.xrange(dead_letter_stream)
+                assert len(dead_letters) == 1
+                dead_letter_id, dead_letter = dead_letters[0]
+
+                assert dead_letter["source_stream"] == source_stream
+                assert dead_letter["source_group"] == source_group
+                assert dead_letter["source_message_id"] == message_id
+                assert json.loads(dead_letter["payload"]) == conflicting_payload
+                assert dead_letter["reason"] == "EventPayloadConflictError"
+
+                message_identity = json.dumps(
+                    [source_stream, source_group, message_id],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                assert redis_client.hgetall(
+                    f"{dead_letter_stream}:dedup",
+                ) == {message_identity: dead_letter_id}
+
+                assert redis_client.xpending(
+                    source_stream,
+                    source_group,
+                )["pending"] == 0
+
+                assert redis_client.xrange(source_stream) == [
+                    (message_id, conflicting_payload),
+                ]
+            finally:
+                redis_client.delete(
+                    source_stream,
+                    dead_letter_stream,
+                    f"{dead_letter_stream}:dedup",
+                )
     finally:
         engine.dispose()
