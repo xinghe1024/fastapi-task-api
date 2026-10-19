@@ -374,6 +374,48 @@ def handle_message_failure(
     return "dead_letter"
 
 
+def handle_retryable_message_failure(
+    redis_client: SyncRedis,
+    failure_counts_key: str,
+    dead_letter_stream: str,
+    source_stream: str,
+    source_group: str,
+    source_message_id: str,
+    payload: dict[str, str],
+    error: Exception,
+    attempt_id: str,
+    max_attempts: int = 3,
+) -> Literal["retry", "dead_letter"]:
+    """记录可重试业务失败，再执行已有的失败处理策略。"""
+    if not isinstance(error, RetryableMessageError):
+        raise error
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+
+    failed_attempts = record_message_failure_once(
+        redis_client=redis_client,
+        failure_counts_key=failure_counts_key,
+        source_stream=source_stream,
+        source_group=source_group,
+        source_message_id=source_message_id,
+        attempt_id=attempt_id,
+    )
+
+    return handle_message_failure(
+        redis_client=redis_client,
+        dead_letter_stream=dead_letter_stream,
+        source_stream=source_stream,
+        source_group=source_group,
+        source_message_id=source_message_id,
+        payload=payload,
+        error=error,
+        failed_attempts=failed_attempts,
+        max_attempts=max_attempts,
+    )
+
+
+
 def process_completion_with_failure_policy(
     engine: Engine,
     redis_client: SyncRedis,
@@ -3165,7 +3207,19 @@ def test_message_failure_count_recovers_after_lost_reply(
     os.getenv("RUN_REDIS_INTEGRATION") != "1",
     reason="需要显式启用 Redis 集成测试",
 )
-def test_concurrent_failure_records_same_attempt_once():
+@pytest.mark.parametrize(
+    "attempt_ids, expected_results, expected_count",
+    [
+        (("attempt-a", "attempt-a"), [1, 1], 1),
+        (("attempt-a", "attempt-b"), [1, 2], 2),
+    ],
+    ids=["same-attempt", "different-attempts"],
+)
+def test_concurrent_failure_counts_distinguish_attempts(
+    attempt_ids: tuple[str, str],
+    expected_results: list[int],
+    expected_count: int,
+):
     redis_url = os.getenv(
         "TEST_REDIS_URL",
         "redis://127.0.0.1:6380/0",
@@ -3186,16 +3240,18 @@ def test_concurrent_failure_records_same_attempt_once():
         "source_stream": "tasks",
         "source_group": "completion-workers",
         "source_message_id": "1000-0",
-        "attempt_id": "attempt-a",
     }
 
-    def record_from_client(redis_client: SyncRedis) -> int:
-        # 先确认连接可用，再等待另一个调用准备完成。
+    def record_from_client(
+        redis_client: SyncRedis,
+        attempt_id: str,
+    ) -> int:
         redis_client.ping()
         start_barrier.wait()
 
         return record_message_failure_once(
             redis_client=redis_client,
+            attempt_id=attempt_id,
             **message_context,
         )
 
@@ -3211,14 +3267,15 @@ def test_concurrent_failure_records_same_attempt_once():
             assert first_client is not second_client
 
             with ThreadPoolExecutor(max_workers=2) as executor:
-                # 必须先提交两个任务，再等待各自的结果。
                 first_future = executor.submit(
                     record_from_client,
                     first_client,
+                    attempt_ids[0],
                 )
                 second_future = executor.submit(
                     record_from_client,
                     second_client,
+                    attempt_ids[1],
                 )
 
                 results = [
@@ -3226,20 +3283,434 @@ def test_concurrent_failure_records_same_attempt_once():
                     second_future.result(timeout=10),
                 ]
 
-            assert results == [1, 1]
+            # 不限定哪个尝试先在 Redis 中完成记录。
+            assert sorted(results) == expected_results
 
             assert first_client.hgetall(
                 failure_counts_key
             ) == {
-                '["tasks","completion-workers","1000-0"]': "1",
+                '["tasks","completion-workers","1000-0"]': str(
+                    expected_count
+                ),
             }
+
+            # 每个尝试保存的计数，应与该次调用的返回值一致。
+            expected_attempts = {}
+            for attempt_id, result in zip(attempt_ids, results):
+                attempt_identity = json.dumps(
+                    [
+                        "tasks",
+                        "completion-workers",
+                        "1000-0",
+                        attempt_id,
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                expected_attempts[attempt_identity] = str(result)
+
             assert second_client.hgetall(
                 recorded_attempts_key
-            ) == {
-                '["tasks","completion-workers","1000-0","attempt-a"]': "1",
-            }
+            ) == expected_attempts
         finally:
             first_client.delete(
+                failure_counts_key,
+                recorded_attempts_key,
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要显式启用 Redis 集成测试",
+)
+@pytest.mark.parametrize(
+    "other_identity",
+    [
+        ("other-tasks", "completion-workers", "1000-0"),
+        ("tasks", "other-workers", "1000-0"),
+        ("tasks", "completion-workers", "1000-1"),
+    ],
+    ids=["different-stream", "different-group", "different-message"],
+)
+def test_failure_count_isolates_message_identity(
+    other_identity: tuple[str, str, str],
+):
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+    failure_counts_key = (
+        f"test:message-failure-counts:{uuid4().hex}"
+    )
+    recorded_attempts_key = f"{failure_counts_key}:attempts"
+
+    message_identities = [
+        ("tasks", "completion-workers", "1000-0"),
+        other_identity,
+    ]
+    attempt_id = "attempt-a"
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    ) as redis_client:
+        try:
+            # 第一轮分别记录，第二轮重复记录，各自都应返回 1。
+            for _ in range(2):
+                for (
+                    source_stream,
+                    source_group,
+                    source_message_id,
+                ) in message_identities:
+                    recorded_count = record_message_failure_once(
+                        redis_client=redis_client,
+                        failure_counts_key=failure_counts_key,
+                        source_stream=source_stream,
+                        source_group=source_group,
+                        source_message_id=source_message_id,
+                        attempt_id=attempt_id,
+                    )
+
+                    assert recorded_count == 1
+
+            expected_counts = {}
+            expected_attempts = {}
+
+            for message_identity in message_identities:
+                message_field = json.dumps(
+                    message_identity,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                attempt_field = json.dumps(
+                    [*message_identity, attempt_id],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+
+                expected_counts[message_field] = "1"
+                expected_attempts[attempt_field] = "1"
+
+            assert redis_client.hgetall(
+                failure_counts_key
+            ) == expected_counts
+            assert redis_client.hgetall(
+                recorded_attempts_key
+            ) == expected_attempts
+        finally:
+            redis_client.delete(
+                failure_counts_key,
+                recorded_attempts_key,
+            )
+
+
+@pytest.mark.skipif(
+    os.getenv("RUN_REDIS_INTEGRATION") != "1",
+    reason="需要显式启用 Redis 集成测试",
+)
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "none",
+        "before-save",
+        "after-save",
+        "before-ack",
+        "after-ack",
+    ],
+    ids=[
+        "normal",
+        "archive-fails-before-save",
+        "archive-reply-lost",
+        "ack-fails-before-execution",
+        "ack-reply-lost",
+    ],
+)
+def test_counted_failure_reaches_limit_and_archives(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+):
+    redis_url = os.getenv(
+        "TEST_REDIS_URL",
+        "redis://127.0.0.1:6380/0",
+    )
+    test_prefix = f"test:counted-failure:{uuid4().hex}"
+
+    source_stream = f"{test_prefix}:source"
+    dead_letter_stream = f"{test_prefix}:dead-letter"
+    dead_letter_index = f"{dead_letter_stream}:dedup"
+    failure_counts_key = f"{test_prefix}:counts"
+    recorded_attempts_key = f"{failure_counts_key}:attempts"
+
+    source_group = "completion-workers"
+    payload = {
+        "event_id": "event-a",
+        "increment_by": "3",
+    }
+
+    with SyncRedis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+    ) as redis_client:
+        try:
+            source_message_id = redis_client.xadd(
+                source_stream,
+                payload,
+            )
+            redis_client.xgroup_create(
+                source_stream,
+                source_group,
+                id="0-0",
+            )
+
+            # 必须真正领取消息，让它进入待确认列表。
+            received = redis_client.xreadgroup(
+                groupname=source_group,
+                consumername="worker-a",
+                streams={source_stream: ">"},
+                count=1,
+            )
+            assert received == [
+                [source_stream, [(source_message_id, payload)]],
+            ]
+
+            message_parts = [
+                source_stream,
+                source_group,
+                source_message_id,
+            ]
+            message_identity = json.dumps(
+                message_parts,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            expected_attempts = {}
+            saved_dead_letter_id: str | None = None
+
+            attempt_cases = [
+                ("attempt-a", "retry"),
+                ("attempt-b", "retry"),
+                ("attempt-c", "dead_letter"),
+            ]
+
+            for failure_count, (
+                    attempt_id,
+                    expected_action,
+            ) in enumerate(attempt_cases, start=1):
+                call_arguments = {
+                    "redis_client": redis_client,
+                    "failure_counts_key": failure_counts_key,
+                    "dead_letter_stream": dead_letter_stream,
+                    "source_stream": source_stream,
+                    "source_group": source_group,
+                    "source_message_id": source_message_id,
+                    "payload": payload,
+                    "error": RetryableMessageError(
+                        "Temporary business failure"
+                    ),
+                    "attempt_id": attempt_id,
+                    "max_attempts": 3,
+                }
+
+                if failure_mode != "none" and failure_count == 3:
+                    real_eval = redis_client.eval
+                    injected_error = RedisConnectionError(
+                        "Simulated Redis operation failure"
+                    )
+
+                    real_xack = redis_client.xack
+
+                    def acknowledge_then_lose_reply(
+                        stream_name: str,
+                        group_name: str,
+                        message_id: str,
+                    ) -> None:
+                        # 先确认真实命令成功，再模拟调用方没收到回复。
+                        acknowledged_count = real_xack(
+                            stream_name,
+                            group_name,
+                            message_id,
+                        )
+                        assert acknowledged_count == 1
+                        raise injected_error
+
+                    if failure_mode == "before-ack":
+                        # 调用确认入口时直接失败，不执行真实 XACK。
+                        ack_spy = Mock(side_effect=injected_error)
+                    elif failure_mode == "after-ack":
+                        ack_spy = Mock(
+                            side_effect=acknowledge_then_lose_reply,
+                        )
+                    else:
+                        ack_spy = Mock(wraps=real_xack)
+
+                    def fail_dead_letter_script(
+                            script, number_of_keys, *arguments,
+                    ):
+                        if (
+                                script == WRITE_DEAD_LETTER_ONCE_SCRIPT
+                                and failure_mode in ("before-save", "after-save")
+                        ):
+                            if failure_mode == "after-save":
+                                real_eval(
+                                    script, number_of_keys, *arguments,
+                                )
+
+                            raise injected_error
+
+                        # 确认失败这一组，计数和死信保存都真实执行。
+                        return real_eval(
+                            script, number_of_keys, *arguments,
+                        )
+
+                    with monkeypatch.context() as failure_patch:
+                        failure_patch.setattr(
+                            redis_client,
+                            "eval",
+                            fail_dead_letter_script,
+                        )
+                        failure_patch.setattr(
+                            redis_client,
+                            "xack",
+                            ack_spy,
+                        )
+
+                        with pytest.raises(
+                                RedisConnectionError,
+                        ) as captured:
+                            handle_retryable_message_failure(
+                                **call_arguments,
+                            )
+
+                    assert captured.value is injected_error
+
+                    if failure_mode in ("before-ack", "after-ack"):
+                        ack_spy.assert_called_once_with(
+                            source_stream,
+                            source_group,
+                            source_message_id,
+                        )
+                    else:
+                        ack_spy.assert_not_called()
+
+                    assert redis_client.hgetall(
+                        failure_counts_key
+                    ) == {message_identity: "3"}
+
+                    failed_attempt_identity = json.dumps(
+                        [*message_parts, attempt_id],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    assert redis_client.hgetall(
+                        recorded_attempts_key
+                    ) == {
+                               **expected_attempts,
+                               failed_attempt_identity: "3",
+                           }
+
+                    remaining_messages = redis_client.xpending_range(
+                        source_stream, source_group, "-", "+", 10,
+                    )
+                    expected_pending_after_failure = (
+                        []
+                        if failure_mode == "after-ack"
+                        else [source_message_id]
+                    )
+                    assert [
+                               entry["message_id"]
+                               for entry in remaining_messages
+                           ] == expected_pending_after_failure
+
+                    if failure_mode == "before-save":
+                        assert redis_client.xlen(dead_letter_stream) == 0
+                        assert redis_client.exists(dead_letter_index) == 0
+                    else:
+                        saved_dead_letters = redis_client.xrange(
+                            dead_letter_stream
+                        )
+                        assert len(saved_dead_letters) == 1
+
+                        saved_dead_letter_id = saved_dead_letters[0][0]
+
+                        assert redis_client.hgetall(
+                            dead_letter_index
+                        ) == {
+                                   message_identity: saved_dead_letter_id,
+                               }
+
+                # 正常路径直接执行；故障路径恢复后沿用原编号重试。
+                action = handle_retryable_message_failure(
+                    **call_arguments,
+                )
+
+                assert action == expected_action
+                assert redis_client.hgetall(
+                    failure_counts_key
+                ) == {message_identity: str(failure_count)}
+
+                attempt_identity = json.dumps(
+                    [*message_parts, attempt_id],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                expected_attempts[attempt_identity] = str(
+                    failure_count
+                )
+                assert redis_client.hgetall(
+                    recorded_attempts_key
+                ) == expected_attempts
+
+                pending_messages = redis_client.xpending_range(
+                    source_stream,
+                    source_group,
+                    "-",
+                    "+",
+                    10,
+                )
+                expected_pending_ids = (
+                    [source_message_id]
+                    if expected_action == "retry"
+                    else []
+                )
+                assert [
+                           entry["message_id"]
+                           for entry in pending_messages
+                       ] == expected_pending_ids
+
+                if expected_action == "retry":
+                    assert redis_client.xlen(dead_letter_stream) == 0
+                    assert redis_client.exists(dead_letter_index) == 0
+
+            # 三次失败处理结束后，应该只保存了一条死信。
+            dead_letters = redis_client.xrange(dead_letter_stream)
+            assert len(dead_letters) == 1
+
+            dead_letter_id, dead_letter = dead_letters[0]
+            if saved_dead_letter_id is not None:
+                assert dead_letter_id == saved_dead_letter_id
+            assert dead_letter["source_stream"] == source_stream
+            assert dead_letter["source_group"] == source_group
+            assert dead_letter["source_message_id"] == source_message_id
+            assert json.loads(dead_letter["payload"]) == payload
+            assert dead_letter["reason"] == "RetryableMessageError"
+
+            assert redis_client.hgetall(
+                dead_letter_index
+            ) == {message_identity: dead_letter_id}
+
+            # 确认消息不会删除原 Stream 中的正文。
+            assert redis_client.xrange(source_stream) == [
+                (source_message_id, payload),
+            ]
+        finally:
+            redis_client.delete(
+                source_stream,
+                dead_letter_stream,
+                dead_letter_index,
                 failure_counts_key,
                 recorded_attempts_key,
             )
